@@ -18,13 +18,13 @@ import java.util.List;
  * validates it, wires all layers, and enters the ACP message loop.
  *
  * <pre>
- * java --enable-native-access=ALL-UNNAMED -jar win-acp-java-runtime.jar --config agent.yaml
+ * java --enable-native-access=ALL-UNNAMED -jar win-acp-java-runtime.jar --config application.yml
  * </pre>
  */
 public class Main {
 
     private static final Logger log = LoggerFactory.getLogger(Main.class);
-    private static final String DEFAULT_CLASSPATH_CONFIG = "agent-default.yaml";
+    private static final String DEFAULT_CONFIG = "application.yml";
 
     public static void main(String[] args) {
         log.info("win-acp-java starting");
@@ -34,17 +34,9 @@ public class Main {
             String configPath = resolveConfigPath(args);
             log.info("Configuration path: {}", configPath);
 
-            // 2. Load configuration
+            // 2. Load configuration (fails fast if missing)
             ConfigLoader loader = new ConfigLoader();
-            RuntimeConfiguration config;
-
-            Path externalPath = Path.of(configPath);
-            if (java.nio.file.Files.exists(externalPath)) {
-                config = loader.load(externalPath);
-            } else {
-                log.warn("External config '{}' not found – falling back to built-in default", configPath);
-                config = loader.loadFromClasspath(DEFAULT_CLASSPATH_CONFIG);
-            }
+            RuntimeConfiguration config = loader.load(Path.of(configPath));
 
             // 3. Validate configuration
             ConfigValidator validator = new ConfigValidator();
@@ -66,10 +58,22 @@ public class Main {
             AgentGraphRunner graphRunner = new AgentGraphRunner(config.getBehavior());
             // TODO: register node implementations based on config.getBehavior().getNodes()
 
-            // 6. Start ACP server
+            // 6. Start ACP server (blocks until shutdown)
             AcpAgentServer server = new AcpAgentServer(graphRunner);
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                log.info("Shutdown signal received");
+                server.shutdown();
+            }));
             server.start();
 
+            log.info("win-acp-java agent is ready – waiting for ACP requests on stdin");
+
+            // Keep the process alive until interrupted
+            Thread.currentThread().join();
+
+        } catch (InterruptedException e) {
+            log.info("Agent interrupted – shutting down");
+            Thread.currentThread().interrupt();
         } catch (Exception e) {
             log.error("Fatal error during startup", e);
             System.exit(2);
@@ -77,18 +81,19 @@ public class Main {
     }
 
     private static String resolveConfigPath(String[] args) {
-        // --config <path>  or  env WIN_ACP_CONFIG
+        // --config <path>
         for (int i = 0; i < args.length - 1; i++) {
             if ("--config".equals(args[i])) {
                 return args[i + 1];
             }
         }
 
+        // Environment variable
         String envPath = System.getenv("WIN_ACP_CONFIG");
         if (envPath != null && !envPath.isBlank()) {
             return envPath;
         }
 
-        return "agent.yaml";
+        return DEFAULT_CONFIG;
     }
 }

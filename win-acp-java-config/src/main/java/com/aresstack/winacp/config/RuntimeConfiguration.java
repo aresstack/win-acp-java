@@ -1,5 +1,7 @@
 package com.aresstack.winacp.config;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -9,6 +11,7 @@ import java.util.List;
  * This is the root of the entire agent configuration and contains all
  * configurable sections defined in the product requirements (§8.6).
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class RuntimeConfiguration {
 
     // --- Agent metadata ---

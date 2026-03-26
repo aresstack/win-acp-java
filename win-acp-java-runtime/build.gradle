@@ -1,5 +1,18 @@
 // win-acp-java-runtime – Main entry point, wires all layers together
 
+plugins {
+    id 'application'
+}
+
+application {
+    mainClass = 'com.aresstack.winacp.runtime.Main'
+    applicationDefaultJvmArgs = ['--enable-native-access=ALL-UNNAMED']
+}
+
+run {
+    workingDir = rootProject.projectDir
+}
+
 dependencies {
     implementation project(':win-acp-java-config')
     implementation project(':win-acp-java-acp')
@@ -16,4 +29,3 @@ jar {
         attributes 'Main-Class': 'com.aresstack.winacp.runtime.Main'
     }
 }
-
