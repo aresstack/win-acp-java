@@ -6,7 +6,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -25,9 +24,19 @@ public class ConfigLoader {
      * File type is inferred from extension (.yaml/.yml → YAML, otherwise JSON).
      */
     public RuntimeConfiguration load(Path path) throws IOException {
-        log.info("Loading configuration from {}", path);
+        log.info("Loading configuration from {}", path.toAbsolutePath());
+
         if (!Files.exists(path)) {
-            throw new IOException("Configuration file not found: " + path);
+            throw new IOException(
+                    "Configuration file not found: " + path.toAbsolutePath() + "\n" +
+                    "\n" +
+                    "Please provide a valid configuration file. Options:\n" +
+                    "  1. Place an 'application.yml' in the working directory\n" +
+                    "  2. Pass --config <path> as command-line argument\n" +
+                    "  3. Set the environment variable WIN_ACP_CONFIG=<path>\n" +
+                    "\n" +
+                    "A sample configuration is available at: agent.example.yaml"
+            );
         }
 
         String filename = path.getFileName().toString().toLowerCase();
@@ -36,31 +45,7 @@ public class ConfigLoader {
                 : JSON_MAPPER;
 
         RuntimeConfiguration config = mapper.readValue(path.toFile(), RuntimeConfiguration.class);
-        log.info("Configuration loaded successfully");
+        log.info("Configuration loaded successfully from {}", path.toAbsolutePath());
         return config;
-    }
-
-    /**
-     * Load configuration from a classpath resource.
-     *
-     * @param resourceName resource path, e.g. "agent-default.yaml"
-     */
-    public RuntimeConfiguration loadFromClasspath(String resourceName) throws IOException {
-        log.info("Loading configuration from classpath resource: {}", resourceName);
-
-        try (InputStream is = Thread.currentThread().getContextClassLoader()
-                .getResourceAsStream(resourceName)) {
-            if (is == null) {
-                throw new IOException("Classpath resource not found: " + resourceName);
-            }
-
-            ObjectMapper mapper = (resourceName.endsWith(".yaml") || resourceName.endsWith(".yml"))
-                    ? YAML_MAPPER
-                    : JSON_MAPPER;
-
-            RuntimeConfiguration config = mapper.readValue(is, RuntimeConfiguration.class);
-            log.info("Configuration loaded successfully from classpath");
-            return config;
-        }
     }
 }
