@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -38,5 +39,28 @@ public class ConfigLoader {
         log.info("Configuration loaded successfully");
         return config;
     }
-}
 
+    /**
+     * Load configuration from a classpath resource.
+     *
+     * @param resourceName resource path, e.g. "agent-default.yaml"
+     */
+    public RuntimeConfiguration loadFromClasspath(String resourceName) throws IOException {
+        log.info("Loading configuration from classpath resource: {}", resourceName);
+
+        try (InputStream is = Thread.currentThread().getContextClassLoader()
+                .getResourceAsStream(resourceName)) {
+            if (is == null) {
+                throw new IOException("Classpath resource not found: " + resourceName);
+            }
+
+            ObjectMapper mapper = (resourceName.endsWith(".yaml") || resourceName.endsWith(".yml"))
+                    ? YAML_MAPPER
+                    : JSON_MAPPER;
+
+            RuntimeConfiguration config = mapper.readValue(is, RuntimeConfiguration.class);
+            log.info("Configuration loaded successfully from classpath");
+            return config;
+        }
+    }
+}

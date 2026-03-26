@@ -24,6 +24,7 @@ import java.util.List;
 public class Main {
 
     private static final Logger log = LoggerFactory.getLogger(Main.class);
+    private static final String DEFAULT_CLASSPATH_CONFIG = "agent-default.yaml";
 
     public static void main(String[] args) {
         log.info("win-acp-java starting");
@@ -35,7 +36,15 @@ public class Main {
 
             // 2. Load configuration
             ConfigLoader loader = new ConfigLoader();
-            RuntimeConfiguration config = loader.load(Path.of(configPath));
+            RuntimeConfiguration config;
+
+            Path externalPath = Path.of(configPath);
+            if (java.nio.file.Files.exists(externalPath)) {
+                config = loader.load(externalPath);
+            } else {
+                log.warn("External config '{}' not found – falling back to built-in default", configPath);
+                config = loader.loadFromClasspath(DEFAULT_CLASSPATH_CONFIG);
+            }
 
             // 3. Validate configuration
             ConfigValidator validator = new ConfigValidator();
@@ -83,4 +92,3 @@ public class Main {
         return "agent.yaml";
     }
 }
-
