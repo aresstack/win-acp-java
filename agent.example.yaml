@@ -1,0 +1,77 @@
+# win-acp-java – Example Agent Configuration
+# Place this file next to the agent JAR or pass via --config / WIN_ACP_CONFIG
+
+profile:
+  id: default
+  name: Default Agent
+  description: General-purpose ACP agent with MCP tool support
+  systemRole: >
+    You are a helpful assistant. Use available tools when needed.
+    Always ask for approval before performing destructive actions.
+
+behavior:
+  startNode: analyze
+  maxIterations: 20
+  abortMessage: Maximum iterations reached – aborting.
+  nodes:
+    - id: analyze
+      type: ANALYZE_INPUT
+    - id: goal
+      type: DETERMINE_GOAL
+    - id: select_tool
+      type: SELECT_TOOL
+    - id: exec_tool
+      type: EXECUTE_TOOL
+    - id: eval_result
+      type: EVALUATE_TOOL_RESULT
+    - id: respond
+      type: FORMULATE_RESPONSE
+    - id: finalize
+      type: FINALIZE
+    - id: error
+      type: HANDLE_ERROR
+    - id: approval
+      type: REQUEST_APPROVAL
+    - id: clarify
+      type: GENERATE_CLARIFICATION
+  edges:
+    - { from: analyze,     to: goal,        condition: ALWAYS }
+    - { from: goal,        to: select_tool, condition: TOOL_REQUIRED }
+    - { from: goal,        to: respond,     condition: TOOL_NOT_REQUIRED }
+    - { from: select_tool, to: approval,    condition: APPROVAL_REQUIRED }
+    - { from: select_tool, to: exec_tool,   condition: TOOL_ALLOWED }
+    - { from: select_tool, to: error,       condition: TOOL_NOT_ALLOWED }
+    - { from: approval,    to: exec_tool,   condition: ALWAYS }
+    - { from: exec_tool,   to: eval_result, condition: ALWAYS }
+    - { from: eval_result, to: respond,     condition: RESULT_SUFFICIENT }
+    - { from: eval_result, to: clarify,     condition: RESULT_INSUFFICIENT }
+    - { from: clarify,     to: finalize,    condition: ALWAYS }
+    - { from: respond,     to: finalize,    condition: ALWAYS }
+    - { from: error,       to: finalize,    condition: ALWAYS }
+
+mcpServers:
+  - id: filesystem
+    name: Filesystem MCP
+    transport: stdio
+    command: npx -y @modelcontextprotocol/server-filesystem .
+    timeoutSeconds: 30
+
+toolPolicy:
+  allowedTools: []
+  blockedTools: []
+  approvalRequiredTools: []
+  maxToolCallsPerTurn: 10
+
+approvalPolicy:
+  enabled: true
+  approvalRequiredByDefault: false
+
+inference:
+  modelPath: C:/Models/phi-3-mini-4k-instruct.onnx
+  backend: directml
+  maxTokens: 2048
+  temperature: 0.7
+
+logLevel: INFO
+debugGraphTracing: false
+

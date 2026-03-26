@@ -1,0 +1,7 @@
+// win-acp-java-inference – Local inference abstraction over Windows ML runtime
+
+dependencies {
+    api project(':win-acp-java-config')
+    implementation project(':win-acp-java-windows-bindings')
+}
+

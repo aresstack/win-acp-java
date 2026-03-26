@@ -15,8 +15,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $tag = "v$Version"
 
-if (-not (Test-Path 'pom.xml')) {
-    Write-Error "pom.xml not found. Run this script from the repository root."
+if (-not (Test-Path 'build.gradle')) {
+    Write-Error "build.gradle not found. Run this script from the repository root."
 }
 
 $existingTag = git tag -l $tag
@@ -24,34 +24,38 @@ if ($existingTag) {
     Write-Error "Tag $tag already exists. Choose a different version."
 }
 
-# --- Update version in pom.xml ---
-Write-Host "[1/5] Updating pom.xml ..." -ForegroundColor Cyan
-$pomBytes  = [System.IO.File]::ReadAllBytes("$PWD\pom.xml")
-$pomText   = [System.Text.Encoding]::UTF8.GetString($pomBytes)
-$pomNew    = $pomText -replace '(<version>)[^<]+(</version>([\s\S]*?)<packaging>)', "`${1}$Version`${2}"
-if ($pomNew -ne $pomText) {
-    [System.IO.File]::WriteAllBytes("$PWD\pom.xml", [System.Text.Encoding]::UTF8.GetBytes($pomNew))
-    Write-Host "       pom.xml -> $Version" -ForegroundColor Green
+# --- Update version in build.gradle ---
+Write-Host "[1/5] Updating build.gradle ..." -ForegroundColor Cyan
+$gradleBytes = [System.IO.File]::ReadAllBytes("$PWD\build.gradle")
+$gradleText  = [System.Text.Encoding]::UTF8.GetString($gradleBytes)
+$gradleNew   = $gradleText -replace "(version\s*=\s*')[^']+(')", "`${1}$Version`${2}"
+if ($gradleNew -ne $gradleText) {
+    [System.IO.File]::WriteAllBytes("$PWD\build.gradle", [System.Text.Encoding]::UTF8.GetBytes($gradleNew))
+    Write-Host "       build.gradle -> $Version" -ForegroundColor Green
 } else {
-    Write-Host "       pom.xml already at $Version" -ForegroundColor Yellow
+    Write-Host "       build.gradle already at $Version" -ForegroundColor Yellow
 }
 
 # --- Update version in README.md ---
 Write-Host "[2/5] Updating README.md ..." -ForegroundColor Cyan
-$readmeBytes = [System.IO.File]::ReadAllBytes("$PWD\README.md")
-$readmeText  = [System.Text.Encoding]::UTF8.GetString($readmeBytes)
-$readmeNew   = $readmeText -replace '(<version>)[^<]+(</version>)', "`${1}$Version`${2}"
-$readmeNew   = $readmeNew  -replace "(implementation\s+'com\.aresstack:win-acp-java:)[^']+'", "`${1}$Version'"
-if ($readmeNew -ne $readmeText) {
-    [System.IO.File]::WriteAllBytes("$PWD\README.md", [System.Text.Encoding]::UTF8.GetBytes($readmeNew))
-    Write-Host "       README.md -> $Version" -ForegroundColor Green
+if (Test-Path 'README.md') {
+    $readmeBytes = [System.IO.File]::ReadAllBytes("$PWD\README.md")
+    $readmeText  = [System.Text.Encoding]::UTF8.GetString($readmeBytes)
+    $readmeNew   = $readmeText -replace '(<version>)[^<]+(</version>)', "`${1}$Version`${2}"
+    $readmeNew   = $readmeNew  -replace "(implementation\s+'com\.aresstack:win-acp-java[^:]*:)[^']+'", "`${1}$Version'"
+    if ($readmeNew -ne $readmeText) {
+        [System.IO.File]::WriteAllBytes("$PWD\README.md", [System.Text.Encoding]::UTF8.GetBytes($readmeNew))
+        Write-Host "       README.md -> $Version" -ForegroundColor Green
+    } else {
+        Write-Host "       README.md already at $Version" -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "       README.md already at $Version" -ForegroundColor Yellow
+    Write-Host "       README.md not found — skipping" -ForegroundColor Yellow
 }
 
 # --- Commit ---
 Write-Host "[3/5] Committing ..." -ForegroundColor Cyan
-git add pom.xml README.md
+git add build.gradle README.md
 $diff = git diff --cached --name-only
 if ($diff) {
     git commit -m "release $Version"
@@ -71,4 +75,3 @@ Write-Host ""
 Write-Host "Done! Tag $tag pushed." -ForegroundColor Green
 Write-Host "GitHub Actions workflow will now build and publish to Maven Central."
 Write-Host "Monitor: https://github.com/aresstack/win-acp-java/actions" -ForegroundColor Yellow
-

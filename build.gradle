@@ -1,22 +1,102 @@
 plugins {
     id 'java'
+    id 'maven-publish'
+    id 'signing'
 }
 
-sourceCompatibility = 21
-targetCompatibility = 21
-
-compileJava.options.encoding = 'UTF-8'
-compileTestJava.options.encoding = 'UTF-8'
-
-repositories {
-    mavenCentral()
+allprojects {
+    group = 'com.aresstack'
+    version = '0.1.0-beta.1'
 }
 
-dependencies {
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
-}
+subprojects {
+    apply plugin: 'java-library'
+    apply plugin: 'maven-publish'
+    apply plugin: 'signing'
 
-test {
-    useJUnitPlatform()
-}
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+        withSourcesJar()
+        withJavadocJar()
+    }
 
+    compileJava.options.encoding = 'UTF-8'
+    compileTestJava.options.encoding = 'UTF-8'
+
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        // Logging
+        implementation 'org.slf4j:slf4j-api:2.0.13'
+
+        // Test
+        testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+        testRuntimeOnly 'ch.qos.logback:logback-classic:1.5.6'
+    }
+
+    test {
+        useJUnitPlatform()
+    }
+
+    javadoc {
+        options.addStringOption('Xdoclint:none', '-quiet')
+    }
+
+    publishing {
+        publications {
+            mavenJava(MavenPublication) {
+                from components.java
+
+                pom {
+                    name = project.name
+                    description = 'Windows ACP Agent Host for Java 21'
+                    url = 'https://github.com/aresstack/win-acp-java'
+
+                    licenses {
+                        license {
+                            name = 'MIT'
+                            url = 'https://opensource.org/licenses/MIT'
+                        }
+                    }
+
+                    developers {
+                        developer {
+                            id = 'miguel0888'
+                            name = 'miguel0888'
+                        }
+                    }
+
+                    scm {
+                        connection = 'scm:git:git://github.com/aresstack/win-acp-java.git'
+                        developerConnection = 'scm:git:ssh://git@github.com/aresstack/win-acp-java.git'
+                        url = 'https://github.com/aresstack/win-acp-java'
+                    }
+                }
+            }
+        }
+
+        repositories {
+            maven {
+                name = 'central'
+                url = 'https://central.sonatype.com/api/v1/publisher/deployments/download/'
+                credentials {
+                    username = System.getenv('CENTRAL_USERNAME') ?: ''
+                    password = System.getenv('CENTRAL_PASSWORD') ?: ''
+                }
+            }
+        }
+    }
+
+    signing {
+        def signingKey = System.getenv('GPG_PRIVATE_KEY')
+        def signingPassword = System.getenv('GPG_PASSPHRASE')
+        if (signingKey) {
+            useInMemoryPgpKeys(signingKey, signingPassword)
+            sign publishing.publications.mavenJava
+        }
+    }
+}

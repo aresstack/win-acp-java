@@ -1,2 +1,9 @@
 rootProject.name = 'win-acp-java'
 
+include 'win-acp-java-config'
+include 'win-acp-java-graph'
+include 'win-acp-java-mcp'
+include 'win-acp-java-inference'
+include 'win-acp-java-windows-bindings'
+include 'win-acp-java-acp'
+include 'win-acp-java-runtime'

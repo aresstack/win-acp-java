@@ -1,0 +1,10 @@
+// win-acp-java-windows-bindings – jextract-generated Windows interop layer
+//
+// This module wraps the low-level FFM bindings for Windows 11 DLLs
+// (DXGI, D3D12, DirectML). Bindings are generated via jextract from
+// Windows SDK headers and must NOT leak into the rest of the codebase.
+
+dependencies {
+    // No external dependencies – pure FFM + Windows SDK bindings
+}
+

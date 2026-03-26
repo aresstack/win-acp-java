@@ -1,0 +1,9 @@
+// win-acp-java-mcp – MCP client integration for tool/resource consumption
+
+dependencies {
+    api project(':win-acp-java-config')
+
+    // MCP SDK – Model Context Protocol client
+    implementation 'io.modelcontextprotocol.sdk:mcp:0.15.0'
+}
+

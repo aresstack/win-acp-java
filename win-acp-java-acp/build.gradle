@@ -1,0 +1,11 @@
+// win-acp-java-acp – ACP protocol layer (Agent Communication Protocol)
+
+dependencies {
+    api project(':win-acp-java-config')
+    implementation project(':win-acp-java-graph')
+
+    // ACP Java SDK – Agent Communication Protocol
+    // TODO: replace with actual ACP SDK coordinates once published
+    // implementation 'com.jetbrains.acp:acp-sdk:x.y.z'
+}
+

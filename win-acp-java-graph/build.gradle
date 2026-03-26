@@ -1,0 +1,11 @@
+// win-acp-java-graph – LangGraph4j-based behavior engine
+
+dependencies {
+    api project(':win-acp-java-config')
+    implementation project(':win-acp-java-mcp')
+    implementation project(':win-acp-java-inference')
+
+    // LangGraph4j – state-machine / graph-based agent behavior
+    implementation 'org.bsc.langgraph4j:langgraph4j-core:1.8.10'
+}
+
