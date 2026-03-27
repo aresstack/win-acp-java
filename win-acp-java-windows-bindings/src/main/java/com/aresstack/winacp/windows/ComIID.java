@@ -60,6 +60,68 @@ public final class ComIID {
             (byte) 0xa9, (byte) 0x8c, (byte) 0xae, (byte) 0x5e,
             (byte) 0x7c, (byte) 0x2a, (byte) 0x57, (byte) 0x3f);
 
+    // ── D3D12 extended ────────────────────────────────────────────────────
+    /** IID_ID3D12CommandAllocator = {6102dee4-af59-4b09-b999-b44d73f09b24} */
+    public static final byte[] IID_ID3D12CommandAllocator_BYTES = guidBytes(
+            0x6102dee4, (short) 0xaf59, (short) 0x4b09,
+            (byte) 0xb9, (byte) 0x99, (byte) 0xb4, (byte) 0x4d,
+            (byte) 0x73, (byte) 0xf0, (byte) 0x9b, (byte) 0x24);
+
+    /** IID_ID3D12GraphicsCommandList = {5b160d0f-ac1b-4185-8ba8-b3ae42a5a455} */
+    public static final byte[] IID_ID3D12GraphicsCommandList_BYTES = guidBytes(
+            0x5b160d0f, (short) 0xac1b, (short) 0x4185,
+            (byte) 0x8b, (byte) 0xa8, (byte) 0xb3, (byte) 0xae,
+            (byte) 0x42, (byte) 0xa5, (byte) 0xa4, (byte) 0x55);
+
+    /** IID_ID3D12Fence = {0a753dcf-c4d8-4b91-adf6-be5a60d95a76} */
+    public static final byte[] IID_ID3D12Fence_BYTES = guidBytes(
+            0x0a753dcf, (short) 0xc4d8, (short) 0x4b91,
+            (byte) 0xad, (byte) 0xf6, (byte) 0xbe, (byte) 0x5a,
+            (byte) 0x60, (byte) 0xd9, (byte) 0x5a, (byte) 0x76);
+
+    /** IID_ID3D12DescriptorHeap = {8efb471d-616c-4f49-90f7-127bb763fa51} */
+    public static final byte[] IID_ID3D12DescriptorHeap_BYTES = guidBytes(
+            0x8efb471d, (short) 0x616c, (short) 0x4f49,
+            (byte) 0x90, (byte) 0xf7, (byte) 0x12, (byte) 0x7b,
+            (byte) 0xb7, (byte) 0x63, (byte) 0xfa, (byte) 0x51);
+
+    /** IID_ID3D12Resource = {696442be-a72e-4059-bc79-5b5c98040fad} */
+    public static final byte[] IID_ID3D12Resource_BYTES = guidBytes(
+            0x696442be, (short) 0xa72e, (short) 0x4059,
+            (byte) 0xbc, (byte) 0x79, (byte) 0x5b, (byte) 0x5c,
+            (byte) 0x98, (byte) 0x04, (byte) 0x0f, (byte) 0xad);
+
+    // ── DirectML extended ─────────────────────────────────────────────────
+    /** IID_IDMLOperator = {26caae7a-3081-4633-9581-226fbe57695d} */
+    public static final byte[] IID_IDMLOperator_BYTES = guidBytes(
+            0x26caae7a, (short) 0x3081, (short) 0x4633,
+            (byte) 0x95, (byte) 0x81, (byte) 0x22, (byte) 0x6f,
+            (byte) 0xbe, (byte) 0x57, (byte) 0x69, (byte) 0x5d);
+
+    /** IID_IDMLCompiledOperator = {6b15e56a-bf5c-4902-92d8-da3a650afea4} */
+    public static final byte[] IID_IDMLCompiledOperator_BYTES = guidBytes(
+            0x6b15e56a, (short) 0xbf5c, (short) 0x4902,
+            (byte) 0x92, (byte) 0xd8, (byte) 0xda, (byte) 0x3a,
+            (byte) 0x65, (byte) 0x0a, (byte) 0xfe, (byte) 0xa4);
+
+    /** IID_IDMLOperatorInitializer = {427c1113-435c-469c-8676-4d5dd072f813} */
+    public static final byte[] IID_IDMLOperatorInitializer_BYTES = guidBytes(
+            0x427c1113, (short) 0x435c, (short) 0x469c,
+            (byte) 0x86, (byte) 0x76, (byte) 0x4d, (byte) 0x5d,
+            (byte) 0xd0, (byte) 0x72, (byte) 0xf8, (byte) 0x13);
+
+    /** IID_IDMLCommandRecorder = {e6857a76-2e3e-4fdd-bff4-5d2ba10fb453} */
+    public static final byte[] IID_IDMLCommandRecorder_BYTES = guidBytes(
+            0xe6857a76, (short) 0x2e3e, (short) 0x4fdd,
+            (byte) 0xbf, (byte) 0xf4, (byte) 0x5d, (byte) 0x2b,
+            (byte) 0xa1, (byte) 0x0f, (byte) 0xb4, (byte) 0x53);
+
+    /** IID_IDMLBindingTable = {29c687dc-de74-4e3b-ab00-1168f2fc3cfc} */
+    public static final byte[] IID_IDMLBindingTable_BYTES = guidBytes(
+            0x29c687dc, (short) 0xde74, (short) 0x4e3b,
+            (byte) 0xab, (byte) 0x00, (byte) 0x11, (byte) 0x68,
+            (byte) 0xf2, (byte) 0xfc, (byte) 0x3c, (byte) 0xfc);
+
     /**
      * Allocate a native GUID segment from the given byte representation.
      *

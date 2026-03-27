@@ -1,34 +1,22 @@
 package com.aresstack.winacp.inference;
 
 import com.aresstack.winacp.config.InferenceConfiguration;
+import com.aresstack.winacp.windows.MnistPipeline;
 import com.aresstack.winacp.windows.WindowsBindings;
 import com.aresstack.winacp.windows.WindowsNativeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
+import java.util.Arrays;
+
 /**
  * Inference engine backed by the Windows native stack (DXGI → D3D12 → DirectML).
  * <p>
- * Uses the {@link WindowsBindings} façade which calls directly into
- * {@code dxgi.dll}, {@code d3d12.dll}, and {@code DirectML.dll}
- * via Java 21 FFM (Foreign Function &amp; Memory API).
+ * Loads {@code mnist-8.onnx} via the {@link MnistPipeline} which executes
+ * entirely on the GPU through DirectML operator dispatches.
  * <p>
- * <b>No third-party inference runtime</b> (no ONNX Runtime, no wrapper libs).
- * All native interop goes through the {@code win-acp-java-windows-bindings} module.
- * <p>
- * V1 proves the vertical slice: device creation, adapter enumeration,
- * and DirectML device initialisation. Full operator dispatch (tensor
- * creation, operator compilation, binding tables, command recording)
- * is V2.
- * <p>
- * For V1, this engine proves:
- * <ol>
- *   <li>DXGI Factory created ✓</li>
- *   <li>GPU adapter enumerated ✓</li>
- *   <li>D3D12 device created ✓</li>
- *   <li>DirectML device created ✓</li>
- *   <li>Stack lifecycle (init/shutdown) ✓</li>
- * </ol>
+ * <b>No third-party inference runtime</b> – pure FFM → Windows DLLs.
  */
 public class DirectMlInferenceEngine implements InferenceEngine {
 
@@ -36,6 +24,7 @@ public class DirectMlInferenceEngine implements InferenceEngine {
 
     private final InferenceConfiguration config;
     private WindowsBindings bindings;
+    private MnistPipeline pipeline;
     private boolean ready = false;
 
     public DirectMlInferenceEngine(InferenceConfiguration config) {
@@ -44,56 +33,71 @@ public class DirectMlInferenceEngine implements InferenceEngine {
 
     @Override
     public void initialize() throws InferenceException {
-        log.info("DirectMlInferenceEngine initializing (backend={})", config.getBackend());
+        log.info("DirectMlInferenceEngine initializing (backend={}, model={})",
+                config.getBackend(), config.getModelPath());
 
         try {
+            // 1. Bring up the Windows native stack
             bindings = new WindowsBindings();
             bindings.init(config.getBackend());
-            ready = true;
 
-            log.info("DirectMlInferenceEngine ready (d3d12={}, directml={})",
-                    bindings.getD3d12Device() != null,
-                    bindings.hasDirectMl());
+            // 2. Load the MNIST model through the DirectML pipeline
+            pipeline = new MnistPipeline(bindings);
+            pipeline.loadModel(Path.of(config.getModelPath()));
+
+            ready = true;
+            log.info("DirectMlInferenceEngine ready – MNIST model loaded via DirectML");
 
         } catch (WindowsNativeException e) {
-            throw new InferenceException(
-                    "Failed to initialize DirectML engine: " + e.getMessage(), e);
+            throw new InferenceException("Failed to initialize DirectML engine: " + e.getMessage(), e);
+        } catch (Exception e) {
+            throw new InferenceException("Failed to load model: " + e.getMessage(), e);
         }
     }
 
     @Override
     public InferenceResult generate(InferenceRequest request) throws InferenceException {
-        if (!ready) {
-            throw new InferenceException("Engine not initialized – call initialize() first");
-        }
+        if (!ready) throw new InferenceException("Engine not initialized");
 
         log.debug("DirectMlInferenceEngine.generate: {}", request);
 
-        // V1: DirectML device is initialised. Full operator dispatch
-        // (DMLCreateOperator, DMLCompileOperator, IDMLCommandRecorder::RecordDispatch)
-        // is V2 scope. For now, return a diagnostic result proving the stack works.
-        String fullPrompt = request.toFullPrompt();
-        int promptTokens = fullPrompt.split("\\s+").length;
+        try {
+            // For MNIST: create a test input (28x28 zeros or parse from prompt)
+            float[] input = new float[784]; // default: zeros
+            String userPrompt = request.getUserPrompt();
 
-        String resultText = String.format(
-                "[DirectML engine active: d3d12=%s, dml=%s, backend=%s] " +
-                        "Operator dispatch not yet implemented (V2). Prompt received: %d tokens.",
-                bindings.getD3d12Device() != null,
-                bindings.hasDirectMl(),
-                config.getBackend(),
-                promptTokens);
+            // If the prompt contains comma-separated floats, parse them as pixel data
+            if (userPrompt != null && userPrompt.contains(",")) {
+                try {
+                    String[] parts = userPrompt.trim().split("[,\\s]+");
+                    if (parts.length == 784) {
+                        for (int i = 0; i < 784; i++) input[i] = Float.parseFloat(parts[i]);
+                    }
+                } catch (NumberFormatException ignore) { /* use zeros */ }
+            }
 
-        return new InferenceResult(resultText, "end_turn",
-                new InferenceResult.Usage(promptTokens, 0, promptTokens));
+            // Run inference through DirectML
+            float[] logits = pipeline.infer(input);
+            int predicted = MnistPipeline.argmax(logits);
+
+            String resultText = String.format(
+                    "MNIST prediction: digit %d (logits: %s)",
+                    predicted, Arrays.toString(logits));
+
+            int promptTokens = request.toFullPrompt().split("\\s+").length;
+            return new InferenceResult(resultText, "end_turn",
+                    new InferenceResult.Usage(promptTokens, 1, promptTokens + 1));
+
+        } catch (WindowsNativeException e) {
+            throw new InferenceException("DirectML inference failed: " + e.getMessage(), e);
+        }
     }
 
     @Override
     public void shutdown() {
         ready = false;
-        if (bindings != null) {
-            bindings.close();
-            bindings = null;
-        }
+        if (pipeline != null) { pipeline.close(); pipeline = null; }
+        if (bindings != null) { bindings.close(); bindings = null; }
         log.info("DirectMlInferenceEngine shut down");
     }
 
