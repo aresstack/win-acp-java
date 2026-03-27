@@ -38,8 +38,8 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 | **acp** | ACP server: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/update` over JSON-RPC 2.0 / stdio | ✅ Implemented |
 | **graph** | LangGraph4j `StateGraph` – configurable agent behavior graph | ✅ Implemented |
 | **mcp** | MCP stdio client: `initialize`, `tools/list`, `tools/call` | ✅ Implemented (happy path) |
-| **inference** | Local inference engine backed by Windows native stack | ✅ DirectML engine (V1: device init) |
-| **windows-bindings** | Hand-written FFM bindings for `dxgi.dll`, `d3d12.dll`, `DirectML.dll` – calls Windows SDK DLLs directly via Java 21 Foreign Function & Memory API | ✅ **FFM bindings implemented** |
+| **inference** | Local inference engine backed by Windows native stack | ✅ DirectML engine (V1: MNIST end-to-end) |
+| **windows-bindings** | Hand-written FFM bindings for `dxgi.dll`, `d3d12.dll`, `DirectML.dll` – calls Windows SDK DLLs directly via Java 21 Foreign Function & Memory API | ✅ **MNIST inference via DirectML – full GPU pipeline working** |
 | **runtime** | Main entry point, wires all layers, `application` plugin | ✅ Implemented |
 
 ---
@@ -148,8 +148,8 @@ win-acp-java/
 ├── win-acp-java-acp/             # ACP JSON-RPC server
 ├── win-acp-java-graph/           # LangGraph4j behavior engine
 ├── win-acp-java-mcp/             # MCP stdio client
-├── win-acp-java-inference/       # Inference abstraction (stub)
-├── win-acp-java-windows-bindings/# FFM/jextract bindings (placeholder)
+├── win-acp-java-inference/       # Inference engine (DirectML MNIST + stub fallback)
+├── win-acp-java-windows-bindings/# FFM bindings: DXGI, D3D12, DirectML – MNIST pipeline
 └── win-acp-java-runtime/         # Main entry point + application plugin
 ```
 
@@ -168,8 +168,31 @@ win-acp-java/
 | DLL | Purpose |
 |---|---|
 | `dxgi.dll` | DXGI Factory, GPU adapter enumeration |
-| `d3d12.dll` | Direct3D 12 device and command queue creation |
-| `DirectML.dll` | DirectML device creation for GPU-accelerated ML |
+| `d3d12.dll` | Direct3D 12 device, command queues, buffers, descriptor heaps, fences |
+| `DirectML.dll` | DirectML operator creation, compilation, dispatch, binding tables |
+
+## MNIST DirectML Pipeline (V1)
+
+The `windows-bindings` module implements a complete GPU inference pipeline for
+[`mnist-8.onnx`](model/mnist-8.onnx) using **only** Java 21 FFM calls to Windows system DLLs:
+
+```
+Input (784 floats, 28×28)
+  ↓ Conv(8,1,5,5) + ReLU  → (1,8,28,28)
+  ↓ MaxPool(2×2)           → (1,8,14,14)
+  ↓ Conv(16,8,5,5) + ReLU → (1,16,14,14)
+  ↓ MaxPool(3×3)           → (1,16,4,4)
+  ↓ Gemm(256→10)           → (1,10)
+  ↓ argmax
+Output: predicted digit 0–9
+```
+
+**Key properties:**
+- **No ORT, no JNA, no JNI** – zero third-party native dependencies
+- All COM vtable calls via `java.lang.foreign.Linker.nativeLinker().downcallHandle()`
+- Weights parsed from ONNX protobuf, uploaded to GPU via D3D12 upload buffers
+- 5 DirectML operators compiled and dispatched per inference
+- Deterministic: same input always produces same output
 
 ## Roadmap
 
@@ -178,24 +201,25 @@ win-acp-java/
 - LangGraph4j-based behavior graph with configurable nodes and edges
 - MCP stdio client (`initialize`, `tools/list`, `tools/call`)
 - YAML configuration loading and validation
-- Inference engine abstraction with explicit stub
+- Inference engine abstraction with explicit stub fallback
 - **FFM bindings for Windows SDK**: hand-written `Linker`/`FunctionDescriptor` calls to `dxgi.dll`, `d3d12.dll`, `DirectML.dll`
-- **DirectML inference engine V1**: DXGI→D3D12→DirectML device creation pipeline
-- `jextract` Gradle task for automated binding generation from Windows SDK headers
+- **MNIST end-to-end GPU inference**: `mnist-8.onnx` parsed, operators created, compiled and dispatched entirely via DirectML – Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm → argmax
+- **DirectML inference engine**: DXGI→D3D12→DirectML device creation, descriptor heaps, binding tables, command recording, GPU synchronization
+- Deterministic multi-run consistency verified
 - CI pipeline (GitHub Actions)
 - Gradle wrapper, multi-module build, Maven Central publishing skeleton
 
+> **V1 scope**: Only `mnist-8.onnx` is supported. This is a deliberate vertical slice to prove the pure-Java FFM → DirectML stack. Generalized ONNX support is a future milestone.
+
 ### 🔜 Next (planned)
-- [ ] DirectML operator dispatch: `DMLCreateOperator`, `CompileOperator`, `RecordDispatch`
-- [ ] jextract-generated FFM bindings to supplement hand-written ones
-- [ ] Tensor creation and buffer management via D3D12 resources
+- [ ] Wire ACP `session/prompt` → LangGraph `INFER` → MNIST → argmax → answer (full vertical)
 - [ ] MCP robustness: error recovery, timeouts, reconnect
 - [ ] ACP streaming support (`session/update` with partial results)
-- [ ] ACP Java SDK integration (when available / stable)
+- [ ] jextract-generated FFM bindings to supplement hand-written ones
 - [ ] Integration tests with real MCP tool servers
-- [ ] GGUF / ONNX model loading (via FFM, not third-party runtime)
 
 ### 🔮 Future
+- [ ] Generalized ONNX operator support (beyond MNIST)
 - [ ] GPU enumeration and selection
 - [ ] Multi-model support
 - [ ] Agent-to-agent communication

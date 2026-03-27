@@ -27,6 +27,13 @@ public final class ComIID {
     /** Size of a GUID in bytes. */
     public static final long GUID_SIZE = GUID_LAYOUT.byteSize(); // 16
 
+    // ── IUnknown ────────────────────────────────────────────────────────────
+    /** IID_IUnknown = {00000000-0000-0000-C000-000000000046} */
+    public static final byte[] IID_IUnknown_BYTES = guidBytes(
+            0x00000000, (short) 0x0000, (short) 0x0000,
+            (byte) 0xC0, (byte) 0x00, (byte) 0x00, (byte) 0x00,
+            (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x46);
+
     // ── DXGI ──────────────────────────────────────────────────────────────
     /** IID_IDXGIFactory1 = {770aae78-f26f-4dba-a829-253c83d1b387} */
     public static final byte[] IID_IDXGIFactory1_BYTES = guidBytes(
