@@ -57,6 +57,7 @@ public final class MnistPipeline implements AutoCloseable {
     // ── Temp / persistent resources per operator ─────────────────────────
     private long[] tempSizes;       // [5]
     private long[] persistSizes;    // [5]
+    private int[] descCounts;       // [5] – cached from allocateBindingResources
     private MemorySegment[] tempBufs;
     private MemorySegment[] persistBufs;
 
@@ -202,7 +203,7 @@ public final class MnistPipeline implements AutoCloseable {
         // Conv1 + fused Relu: (1,1,28,28)→(1,8,28,28), filter(8,1,5,5), bias(1,8,1,1), pad=2
         compiledConv1 = createAndCompileConv(
                 new int[]{1, 1, 28, 28}, new int[]{8, 1, 5, 5}, new int[]{1, 8, 1, 1},
-                new int[]{1, 8, 28, 28}, new int[]{1, 1}, new int[]{2, 2}, new int[]{2, 2}, true);
+                new int[]{1, 8, 28, 28}, new int[]{1, 1}, new int[]{2, 2}, new int[]{2, 2}, true, true);
 
         // MaxPool1: (1,8,28,28)→(1,8,14,14), window=2, stride=2
         compiledPool1 = createAndCompilePool(
@@ -212,7 +213,7 @@ public final class MnistPipeline implements AutoCloseable {
         // Conv2 + fused Relu: (1,8,14,14)→(1,16,14,14), filter(16,8,5,5), bias(1,16,1,1), pad=2
         compiledConv2 = createAndCompileConv(
                 new int[]{1, 8, 14, 14}, new int[]{16, 8, 5, 5}, new int[]{1, 16, 1, 1},
-                new int[]{1, 16, 14, 14}, new int[]{1, 1}, new int[]{2, 2}, new int[]{2, 2}, true);
+                new int[]{1, 16, 14, 14}, new int[]{1, 1}, new int[]{2, 2}, new int[]{2, 2}, true, true);
 
         // MaxPool2: (1,16,14,14)→(1,16,4,4), window=3, stride=3
         compiledPool2 = createAndCompilePool(
@@ -236,16 +237,17 @@ public final class MnistPipeline implements AutoCloseable {
 
         tempSizes = new long[5];
         persistSizes = new long[5];
+        descCounts = new int[5];
         tempBufs = new MemorySegment[5];
         persistBufs = new MemorySegment[5];
         totalDescriptors = 0;
 
         for (int i = 0; i < 5; i++) {
             long[] bp = DirectMlBindings.getBindingProperties(allCompiled[i], arena);
-            int descCount = (int) bp[0];
+            descCounts[i] = (int) bp[0];
             tempSizes[i] = bp[1];
             persistSizes[i] = bp[2];
-            totalDescriptors += descCount;
+            totalDescriptors += descCounts[i];
 
             if (tempSizes[i] > 0) {
                 tempBufs[i] = D3D12Bindings.createDefaultBuffer(dev, tempSizes[i], arena);
@@ -253,7 +255,7 @@ public final class MnistPipeline implements AutoCloseable {
             if (persistSizes[i] > 0) {
                 persistBufs[i] = D3D12Bindings.createDefaultBuffer(dev, persistSizes[i], arena);
             }
-            log.debug("Op[{}]: desc={}, temp={}, persist={}", i, descCount, tempSizes[i], persistSizes[i]);
+            log.debug("Op[{}]: desc={}, temp={}, persist={}", i, descCounts[i], tempSizes[i], persistSizes[i]);
         }
 
         // Add some slack for initializer
@@ -284,8 +286,8 @@ public final class MnistPipeline implements AutoCloseable {
         int initDescCount = (int) initBp[0];
         long initTempSize = initBp[1];
 
-        long cpuStart = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap);
-        long gpuStart = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap);
+        long cpuStart = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+        long gpuStart = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap, arena);
 
         MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, initializer,
                 cpuStart, gpuStart, initDescCount);
@@ -341,48 +343,61 @@ public final class MnistPipeline implements AutoCloseable {
         var dml = wb.getDmlDevice();
 
         // Upload input
+        log.info("INFER: uploading input...");
         D3D12Bindings.uploadFloats(dev, q, inputBuf, input, arena);
 
         // Create command infrastructure for this dispatch
+        log.info("INFER: creating command infrastructure...");
         var alloc = D3D12Bindings.createCommandAllocator(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
         var cmdList = D3D12Bindings.createCommandList(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, arena);
         D3D12Bindings.setDescriptorHeaps(cmdList, descriptorHeap, arena);
 
-        long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap);
-        long gpuBase = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap);
+        long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+        long gpuBase = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+        log.info("INFER: cpuBase=0x{}, gpuBase=0x{}", Long.toHexString(cpuBase), Long.toHexString(gpuBase));
         int descOffset = 0;
 
         // ── Op 0: Conv1 + Relu ───────────────────────────────────────────
+        log.info("INFER: dispatching Op0 (Conv1)...");
         descOffset = dispatchConv(dml, cmdList, compiledConv1, 0,
                 inputBuf, fb(784), conv1FBuf, fb(conv1Filter.length),
                 conv1BBuf, fb(conv1Bias.length), conv1Out, fb(6272),
-                cpuBase, gpuBase, descOffset);
+                true, cpuBase, gpuBase, descOffset);
+        log.info("INFER: Op0 done, descOffset={}", descOffset);
         D3D12Bindings.uavBarrier(cmdList, arena);
 
         // ── Op 1: MaxPool1 ──────────────────────────────────────────────
+        log.info("INFER: dispatching Op1 (Pool1)...");
         descOffset = dispatchPool(dml, cmdList, compiledPool1, 1,
                 conv1Out, fb(6272), pool1Out, fb(1568),
                 cpuBase, gpuBase, descOffset);
+        log.info("INFER: Op1 done, descOffset={}", descOffset);
         D3D12Bindings.uavBarrier(cmdList, arena);
 
         // ── Op 2: Conv2 + Relu ───────────────────────────────────────────
+        log.info("INFER: dispatching Op2 (Conv2)...");
         descOffset = dispatchConv(dml, cmdList, compiledConv2, 2,
                 pool1Out, fb(1568), conv2FBuf, fb(conv2Filter.length),
                 conv2BBuf, fb(conv2Bias.length), conv2Out, fb(3136),
-                cpuBase, gpuBase, descOffset);
+                true, cpuBase, gpuBase, descOffset);
+        log.info("INFER: Op2 done, descOffset={}", descOffset);
         D3D12Bindings.uavBarrier(cmdList, arena);
 
         // ── Op 3: MaxPool2 ──────────────────────────────────────────────
+        log.info("INFER: dispatching Op3 (Pool2)...");
         descOffset = dispatchPool(dml, cmdList, compiledPool2, 3,
                 conv2Out, fb(3136), pool2Out, fb(256),
                 cpuBase, gpuBase, descOffset);
+        log.info("INFER: Op3 done, descOffset={}", descOffset);
         D3D12Bindings.uavBarrier(cmdList, arena);
 
         // ── Op 4: Gemm ──────────────────────────────────────────────────
+        log.info("INFER: dispatching Op4 (Gemm)...");
         descOffset = dispatchGemm(dml, cmdList, compiledGemm, 4,
                 pool2Out, fb(256), fcWBuf, fb(fcWeight.length),
                 fcBBuf, fb(fcBias.length), outputBuf, fb(10),
                 cpuBase, gpuBase, descOffset);
+        log.info("INFER: Op4 done, executing...");
 
         // Execute all dispatches
         D3D12Bindings.executeAndWait(dev, q, cmdList, arena);
@@ -416,24 +431,43 @@ public final class MnistPipeline implements AutoCloseable {
                               MemorySegment filterBuf, long filterSize,
                               MemorySegment biasBuf, long biasSize,
                               MemorySegment outBuf, long outSize,
+                              boolean hasBias,
                               long cpuBase, long gpuBase, int descOff)
             throws WindowsNativeException {
-        long[] bp = DirectMlBindings.getBindingProperties(compiled, arena);
-        int descCount = (int) bp[0];
+        int descCount = descCounts[opIdx];
+        log.info("dispatchConv[{}]: descCount={}", opIdx, descCount);
+        System.out.flush();
 
         MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiled,
                 cpuBase + (long) descOff * descriptorIncrement,
                 gpuBase + (long) descOff * descriptorIncrement, descCount);
+        log.info("dispatchConv[{}]: btDesc allocated, calling createBindingTable...", opIdx);
+        // Debug: dump DML device vtable near slot 12
+        MemorySegment dmlVtable = dml.get(ValueLayout.ADDRESS, 0).reinterpret(Long.MAX_VALUE);
+        for (int s = 7; s <= 13; s++) {
+            MemorySegment fn = dmlVtable.get(ValueLayout.ADDRESS, (long) s * 8).reinterpret(Long.MAX_VALUE);
+            log.info("DMLDevice vtable[{}] = 0x{}", s, Long.toHexString(fn.address()));
+        }
+        System.out.flush();
         MemorySegment bt = DirectMlBindings.createBindingTable(dml, btDesc, arena);
+        log.info("dispatchConv[{}]: binding table created at {}", opIdx, bt);
+        System.out.flush();
 
-        // 3 inputs: data, filter, bias
-        MemorySegment inputs = arena.allocate(16L * 3, 8);
-        setBufferBinding(inputs, 0, inBuf, inSize);
-        setBufferBinding(inputs, 1, filterBuf, filterSize);
-        setBufferBinding(inputs, 2, biasBuf, biasSize);
-        DirectMlBindings.bindInputs(bt, 3, inputs);
-
-        // 1 output
+        if (hasBias) {
+            // 3 inputs: data, filter, bias
+            MemorySegment inputs = arena.allocate(16L * 3, 8);
+            setBufferBinding(inputs, 0, inBuf, inSize);
+            setBufferBinding(inputs, 1, filterBuf, filterSize);
+            setBufferBinding(inputs, 2, biasBuf, biasSize);
+            DirectMlBindings.bindInputs(bt, 3, inputs);
+        } else {
+            // 2 inputs: data, filter (no bias)
+            MemorySegment inputs = arena.allocate(16L * 2, 8);
+            setBufferBinding(inputs, 0, inBuf, inSize);
+            setBufferBinding(inputs, 1, filterBuf, filterSize);
+            DirectMlBindings.bindInputs(bt, 2, inputs);
+        }
+        log.info("dispatchConv[{}]: inputs bound, binding output...", opIdx);
         MemorySegment outputs = arena.allocate(16, 8);
         setBufferBinding(outputs, 0, outBuf, outSize);
         DirectMlBindings.bindOutputs(bt, 1, outputs);
@@ -450,8 +484,7 @@ public final class MnistPipeline implements AutoCloseable {
                               MemorySegment outBuf, long outSize,
                               long cpuBase, long gpuBase, int descOff)
             throws WindowsNativeException {
-        long[] bp = DirectMlBindings.getBindingProperties(compiled, arena);
-        int descCount = (int) bp[0];
+        int descCount = descCounts[opIdx];
 
         MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiled,
                 cpuBase + (long) descOff * descriptorIncrement,
@@ -480,8 +513,7 @@ public final class MnistPipeline implements AutoCloseable {
                               MemorySegment outBuf, long outSize,
                               long cpuBase, long gpuBase, int descOff)
             throws WindowsNativeException {
-        long[] bp = DirectMlBindings.getBindingProperties(compiled, arena);
-        int descCount = (int) bp[0];
+        int descCount = descCounts[opIdx];
 
         MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiled,
                 cpuBase + (long) descOff * descriptorIncrement,

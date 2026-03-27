@@ -61,17 +61,20 @@ public final class DirectMlBindings {
     static final int DML_DEV_CREATE_COMMAND_RECORDER      = 11;
     static final int DML_DEV_CREATE_BINDING_TABLE         = 12;
 
-    // IDMLDispatchable: GetBindingProperties = slot 8 (from IDMLObject chain)
+    // IDMLDispatchable: GetBindingProperties = slot 8
+    // Inheritance: IUnknown(0-2) → IDMLObject(3-6) → IDMLDeviceChild::GetDevice(7) → IDMLPageable(none) → IDMLDispatchable(8)
     static final int DISPATCHABLE_GET_BINDING_PROPERTIES = 8;
 
     // IDMLCommandRecorder: RecordDispatch = slot 8
+    // Inheritance: IUnknown(0-2) → IDMLObject(3-6) → IDMLDeviceChild::GetDevice(7) → IDMLPageable(none) → IDMLCommandRecorder(8)
     static final int RECORDER_RECORD_DISPATCH = 8;
 
-    // IDMLBindingTable: BindInputs=8, BindOutputs=9, BindTemporary=10, BindPersistent=11
-    static final int BT_BIND_INPUTS     = 8;
-    static final int BT_BIND_OUTPUTS    = 9;
-    static final int BT_BIND_TEMPORARY  = 10;
-    static final int BT_BIND_PERSISTENT = 11;
+    // IDMLBindingTable inherits directly from IDMLObject (no IDMLDeviceChild in chain!)
+    // Inheritance: IUnknown(0-2) → IDMLObject(3-6) → IDMLBindingTable(7+)
+    static final int BT_BIND_INPUTS     = 7;
+    static final int BT_BIND_OUTPUTS    = 8;
+    static final int BT_BIND_TEMPORARY  = 9;
+    static final int BT_BIND_PERSISTENT = 10;
 
     // ── DMLCreateDevice function handle ──────────────────────────────────
     private static final FunctionDescriptor DML_CREATE_DEVICE_DESC =
@@ -235,20 +238,32 @@ public final class DirectMlBindings {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * IDMLDispatchable::GetBindingProperties (vtable slot 8).
+     * IDMLDispatchable::GetBindingProperties (vtable slot 7).
      * <p>
-     * Returns struct > 8 bytes → hidden return pointer convention on x64.
+     * Returns DML_BINDING_PROPERTIES struct (24 bytes on x64).
+     * We let the Java FFM Linker handle the hidden sret pointer automatically
+     * by declaring the struct as the return type.
+     *
      * @return long[3]: {requiredDescriptorCount, temporaryResourceSize, persistentResourceSize}
      */
     public static long[] getBindingProperties(MemorySegment dispatchable, Arena arena) {
         try {
-            // DML_BINDING_PROPERTIES: {UINT(4)+pad(4), UINT64(8), UINT64(8)} = 24 bytes
-            MemorySegment retStruct = arena.allocate(24, 8);
-            // Hidden return ptr convention: (retPtr, this)
+            // DML_BINDING_PROPERTIES layout: UINT(4) + pad(4) + UINT64(8) + UINT64(8) = 24 bytes
+            MemoryLayout BINDING_PROPERTIES_LAYOUT = MemoryLayout.structLayout(
+                    ValueLayout.JAVA_INT.withName("RequiredDescriptorCount"),
+                    MemoryLayout.paddingLayout(4),
+                    ValueLayout.JAVA_LONG.withName("TemporaryResourceSize"),
+                    ValueLayout.JAVA_LONG.withName("PersistentResourceSize")
+            );
+
+            // Let the Linker handle the sret convention: return struct, only explicit param is 'this'
             MethodHandle mh = DxgiBindings.vtableMethod(dispatchable,
                     DISPATCHABLE_GET_BINDING_PROPERTIES,
-                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-            mh.invokeExact(retStruct, dispatchable);
+                    FunctionDescriptor.of(BINDING_PROPERTIES_LAYOUT, ValueLayout.ADDRESS));
+
+            // Arena acts as SegmentAllocator for the return struct
+            MemorySegment retStruct = (MemorySegment) mh.invokeExact((SegmentAllocator) arena, dispatchable);
+
             int descCount = retStruct.get(ValueLayout.JAVA_INT, 0);
             long tempSize = retStruct.get(ValueLayout.JAVA_LONG, 8);
             long persistSize = retStruct.get(ValueLayout.JAVA_LONG, 16);
@@ -320,10 +335,10 @@ public final class DirectMlBindings {
         } catch (Throwable t) { throw new RuntimeException("BindPersistent failed", t); }
     }
 
-    /** IDMLBindingTable::Reset (slot 12). */
+    /** IDMLBindingTable::Reset (slot 11). */
     public static void resetBindingTable(MemorySegment bt, MemorySegment newDesc) {
         try {
-            MethodHandle mh = DxgiBindings.vtableMethod(bt, 12,
+            MethodHandle mh = DxgiBindings.vtableMethod(bt, 11,
                     FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
             int hr = (int) mh.invokeExact(bt, newDesc);
             HResult.check(hr, "IDMLBindingTable::Reset");

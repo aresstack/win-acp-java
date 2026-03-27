@@ -452,14 +452,21 @@ public final class D3D12Bindings {
 
     /**
      * ID3D12DescriptorHeap::GetCPUDescriptorHandleForHeapStart (vtable slot 9).
-     * Returns the CPU handle as a long (SIZE_T).
+     * <p>
+     * On modern D3D12 (Windows 11 Agility SDK ABI), these functions take an explicit
+     * output pointer parameter: GetCPUDescriptorHandleForHeapStart(this, pResult).
+     * The 8-byte struct is written to *pResult instead of returned in RAX.
      */
-    public static long getCpuDescriptorHandleForHeapStart(MemorySegment heap) {
+    public static long getCpuDescriptorHandleForHeapStart(MemorySegment heap, Arena arena) {
         try {
-            // Returns D3D12_CPU_DESCRIPTOR_HANDLE { SIZE_T ptr } = 8 bytes → fits in RAX
+            MemorySegment retBuf = arena.allocate(8, 8);
+            // Agility SDK ABI: (this, pResult) → writes result to *pResult
             MethodHandle mh = DxgiBindings.vtableMethod(heap, 9,
-                    FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
-            return (long) mh.invokeExact(heap);
+                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+            mh.invokeExact(heap, retBuf);
+            long handle = retBuf.get(ValueLayout.JAVA_LONG, 0);
+            log.debug("CPU descriptor handle: 0x{}", Long.toHexString(handle));
+            return handle;
         } catch (Throwable t) {
             throw new RuntimeException("GetCPUDescriptorHandleForHeapStart failed", t);
         }
@@ -467,13 +474,17 @@ public final class D3D12Bindings {
 
     /**
      * ID3D12DescriptorHeap::GetGPUDescriptorHandleForHeapStart (vtable slot 10).
-     * Returns the GPU handle as a long (UINT64).
+     * Same Agility SDK ABI as CPU handle – see above.
      */
-    public static long getGpuDescriptorHandleForHeapStart(MemorySegment heap) {
+    public static long getGpuDescriptorHandleForHeapStart(MemorySegment heap, Arena arena) {
         try {
+            MemorySegment retBuf = arena.allocate(8, 8);
             MethodHandle mh = DxgiBindings.vtableMethod(heap, 10,
-                    FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
-            return (long) mh.invokeExact(heap);
+                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+            mh.invokeExact(heap, retBuf);
+            long handle = retBuf.get(ValueLayout.JAVA_LONG, 0);
+            log.debug("GPU descriptor handle: 0x{}", Long.toHexString(handle));
+            return handle;
         } catch (Throwable t) {
             throw new RuntimeException("GetGPUDescriptorHandleForHeapStart failed", t);
         }
