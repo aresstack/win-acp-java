@@ -1,5 +1,8 @@
 package com.aresstack.winacp.graph;
 
+import com.aresstack.winacp.inference.InferenceEngine;
+import com.aresstack.winacp.inference.InferenceRequest;
+import com.aresstack.winacp.inference.InferenceResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -68,8 +71,13 @@ public final class DefaultNodes {
 
     public static AgentState formulateResponse(AgentState state) {
         if (state.getPendingResponse() == null) {
-            String input = state.getUserInput() != null ? state.getUserInput() : "";
-            state.setPendingResponse("Received: " + input);
+            // If inference produced text, use that as the response
+            if (state.getInferenceText() != null && !state.getInferenceText().isBlank()) {
+                state.setPendingResponse(state.getInferenceText());
+            } else {
+                String input = state.getUserInput() != null ? state.getUserInput() : "";
+                state.setPendingResponse("Received: " + input);
+            }
         }
         log.debug("FORMULATE_RESPONSE: '{}'", state.getPendingResponse());
         return state;
@@ -92,5 +100,44 @@ public final class DefaultNodes {
         state.setPendingResponse("This action requires approval. Please confirm.");
         return state;
     }
-}
 
+    /**
+     * Create an INFER node that calls the given {@link InferenceEngine}.
+     * <p>
+     * This is the critical node type: it takes the current state,
+     * builds an {@link InferenceRequest}, runs real inference, and
+     * stores the result text in {@code AgentState.inferenceText}.
+     */
+    public static AgentNode inferNode(InferenceEngine engine) {
+        return state -> {
+            log.debug("INFER: userInput='{}'",
+                    state.getUserInput() != null && state.getUserInput().length() > 60
+                            ? state.getUserInput().substring(0, 60) + "…"
+                            : state.getUserInput());
+
+            try {
+                InferenceRequest request = InferenceRequest.builder()
+                        .systemPrompt(state.getSystemRole() != null ? state.getSystemRole() : "")
+                        .userPrompt(state.getUserInput() != null ? state.getUserInput() : "")
+                        .maxTokens(256)
+                        .temperature(0.7f)
+                        .build();
+
+                InferenceResult result = engine.generate(request);
+
+                state.setInferenceText(result.getText());
+                state.setPendingResponse(result.getText());
+
+                log.info("INFER: finishReason={}, text length={}",
+                        result.getFinishReason(),
+                        result.getText() != null ? result.getText().length() : 0);
+
+            } catch (Exception e) {
+                log.error("INFER failed", e);
+                state.setError("Inference failed: " + e.getMessage());
+            }
+
+            return state;
+        };
+    }
+}

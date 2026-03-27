@@ -42,17 +42,29 @@ public class AcpAgentServer {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final InputStream input;
     private final OutputStream output;
+    private final String systemRole;
 
     /** Active sessions keyed by session ID. */
     private final Map<String, SessionState> sessions = new ConcurrentHashMap<>();
 
     public AcpAgentServer(LangGraphAgentRunner graphRunner) {
-        this(graphRunner, System.in, System.out);
+        this(graphRunner, (String) null);
+    }
+
+    public AcpAgentServer(LangGraphAgentRunner graphRunner, String systemRole) {
+        this(graphRunner, systemRole, System.in, System.out);
     }
 
     /** Testable constructor with custom streams. */
     public AcpAgentServer(LangGraphAgentRunner graphRunner, InputStream input, OutputStream output) {
+        this(graphRunner, null, input, output);
+    }
+
+    /** Full constructor with systemRole and custom streams. */
+    public AcpAgentServer(LangGraphAgentRunner graphRunner, String systemRole,
+                          InputStream input, OutputStream output) {
         this.graphRunner = graphRunner;
+        this.systemRole = systemRole;
         this.input = input;
         this.output = output;
     }
@@ -97,6 +109,7 @@ public class AcpAgentServer {
     public String handleRequest(String userMessage) {
         AgentState state = new AgentState();
         state.setUserInput(userMessage);
+        if (systemRole != null) state.setSystemRole(systemRole);
         AgentState result = graphRunner.run(state);
         return result.getPendingResponse() != null
                 ? result.getPendingResponse()
@@ -260,6 +273,7 @@ public class AcpAgentServer {
         // Execute through LangGraph4j
         AgentState state = new AgentState();
         state.setUserInput(userText);
+        if (systemRole != null) state.setSystemRole(systemRole);
 
         AgentState result = graphRunner.run(state);
 

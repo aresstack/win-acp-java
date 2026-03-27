@@ -21,10 +21,16 @@ public class AgentGraphRunner {
     private final Map<String, List<EdgeDefinition>> edgesFrom = new HashMap<>();
     private final AgentBehaviorDefinition behavior;
     private final Map<NodeType, AgentNode> nodeImplementations = new EnumMap<>(NodeType.class);
+    private com.aresstack.winacp.inference.InferenceEngine inferenceEngine;
 
     public AgentGraphRunner(AgentBehaviorDefinition behavior) {
         this.behavior = behavior;
         indexEdges();
+    }
+
+    /** Inject the inference engine used by INFER nodes. */
+    public void setInferenceEngine(com.aresstack.winacp.inference.InferenceEngine inferenceEngine) {
+        this.inferenceEngine = inferenceEngine;
     }
 
     /** Register a concrete implementation for a given node type. */
@@ -45,6 +51,10 @@ public class AgentGraphRunner {
         registerNode(NodeType.FINALIZE,               DefaultNodes::finalize);
         registerNode(NodeType.HANDLE_ERROR,           DefaultNodes::handleError);
         registerNode(NodeType.REQUEST_APPROVAL,       DefaultNodes::requestApproval);
+
+        if (inferenceEngine != null) {
+            registerNode(NodeType.INFER, DefaultNodes.inferNode(inferenceEngine));
+        }
     }
 
     /**

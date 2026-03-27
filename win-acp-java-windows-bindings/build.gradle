@@ -1,10 +1,12 @@
-// win-acp-java-windows-bindings – jextract-generated Windows interop layer
+// win-acp-java-windows-bindings – Windows native interop layer
 //
-// This module wraps the low-level FFM bindings for Windows 11 DLLs
-// (DXGI, D3D12, DirectML). Bindings are generated via jextract from
-// Windows SDK headers and must NOT leak into the rest of the codebase.
+// V1: Wraps ONNX Runtime (which uses DirectML as execution provider on Windows).
+// Future: jextract-generated raw FFM bindings for DXGI/D3D12/DirectML.
+//
+// All native details are confined to this module and must NOT leak outward.
+// No MemorySegment, MethodHandle, or FunctionDescriptor outside this module.
 
 dependencies {
-    // No external dependencies – pure FFM + Windows SDK bindings
+    // ONNX Runtime – local inference with CPU and DirectML execution providers
+    implementation 'com.microsoft.onnxruntime:onnxruntime:1.20.0'
 }
-

@@ -40,13 +40,16 @@ class MainTest {
                       type: ANALYZE_INPUT
                     - id: goal
                       type: DETERMINE_GOAL
+                    - id: infer
+                      type: INFER
                     - id: respond
                       type: FORMULATE_RESPONSE
                     - id: finalize
                       type: FINALIZE
                   edges:
                     - { from: analyze,  to: goal,     condition: ALWAYS }
-                    - { from: goal,     to: respond,  condition: ALWAYS }
+                    - { from: goal,     to: infer,    condition: ALWAYS }
+                    - { from: infer,    to: respond,  condition: ALWAYS }
                     - { from: respond,  to: finalize, condition: ALWAYS }
 
                 mcpServers: []
@@ -112,5 +115,26 @@ class MainTest {
         assertTrue(ex.getMessage().contains("--config"));
         assertTrue(ex.getMessage().contains("WIN_ACP_CONFIG"));
     }
-}
 
+    /**
+     * InferenceEngine selection: stub is used when model path does not exist.
+     */
+    @Test
+    void createInferenceEngine_noModelFile_returnsStub() {
+        var cfg = new InferenceConfiguration();
+        cfg.setModelPath("/nonexistent/model.onnx");
+        cfg.setBackend("cpu");
+
+        var engine = Main.createInferenceEngine(cfg);
+        assertTrue(engine instanceof com.aresstack.winacp.inference.StubInferenceEngine);
+    }
+
+    /**
+     * InferenceEngine selection: null config returns stub.
+     */
+    @Test
+    void createInferenceEngine_nullConfig_returnsStub() {
+        var engine = Main.createInferenceEngine(null);
+        assertTrue(engine instanceof com.aresstack.winacp.inference.StubInferenceEngine);
+    }
+}

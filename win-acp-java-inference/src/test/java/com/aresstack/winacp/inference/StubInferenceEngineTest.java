@@ -4,8 +4,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.List;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 class StubInferenceEngineTest {
@@ -29,21 +27,26 @@ class StubInferenceEngineTest {
     }
 
     @Test
-    void inferReturnsResult() throws InferenceException {
-        InferenceRequest req = new InferenceRequest("What is 2+2?", List.of(), 100, 0.7f);
-        InferenceResult result = engine.infer(req);
+    void generateReturnsResult() throws InferenceException {
+        InferenceRequest req = InferenceRequest.builder()
+                .userPrompt("What is 2+2?")
+                .maxTokens(100)
+                .temperature(0.7f)
+                .build();
+        InferenceResult result = engine.generate(req);
 
         assertNotNull(result);
-        assertTrue(result.isComplete());
+        assertEquals("end_turn", result.getFinishReason());
         assertFalse(result.getText().isEmpty());
-        assertTrue(result.getTokenCount() > 0);
+        assertNotNull(result.getUsage());
+        assertTrue(result.getUsage().totalTokens() > 0);
     }
 
     @Test
-    void inferBeforeInitThrows() {
+    void generateBeforeInitThrows() {
         StubInferenceEngine cold = new StubInferenceEngine();
         assertThrows(InferenceException.class, () ->
-                cold.infer(new InferenceRequest("test", List.of(), 100, 0.7f)));
+                cold.generate(InferenceRequest.builder().userPrompt("test").build()));
     }
 
     @Test
@@ -52,4 +55,3 @@ class StubInferenceEngineTest {
         assertFalse(engine.isReady());
     }
 }
-

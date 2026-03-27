@@ -3,6 +3,7 @@ package com.aresstack.winacp.runtime;
 import com.aresstack.winacp.acp.AcpAgentServer;
 import com.aresstack.winacp.config.*;
 import com.aresstack.winacp.graph.LangGraphAgentRunner;
+import com.aresstack.winacp.inference.DirectMlInferenceEngine;
 import com.aresstack.winacp.inference.InferenceEngine;
 import com.aresstack.winacp.inference.StubInferenceEngine;
 import com.aresstack.winacp.mcp.McpClientManager;
@@ -10,6 +11,7 @@ import com.aresstack.winacp.mcp.ToolRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -46,8 +48,8 @@ public class Main {
                 System.exit(1);
             }
 
-            // 2. Initialize inference engine
-            InferenceEngine inferenceEngine = new StubInferenceEngine();
+            // 2. Initialize inference engine – real or stub based on config
+            InferenceEngine inferenceEngine = createInferenceEngine(config.getInference());
             inferenceEngine.initialize();
             log.info("Inference engine: {} (ready={})",
                     inferenceEngine.getClass().getSimpleName(), inferenceEngine.isReady());
@@ -61,8 +63,9 @@ public class Main {
             log.info("MCP: {} tool(s) from {} server(s)",
                     toolRegistry.getAllTools().size(), config.getMcpServers().size());
 
-            // 4. Build + wire behavior graph
+            // 4. Build + wire behavior graph with InferenceEngine
             LangGraphAgentRunner graphRunner = new LangGraphAgentRunner(config.getBehavior());
+            graphRunner.setInferenceEngine(inferenceEngine);
             graphRunner.registerDefaults();
             log.info("Behavior graph: startNode='{}', {} node(s), {} edge(s)",
                     config.getBehavior().getStartNode(),
@@ -70,7 +73,8 @@ public class Main {
                     config.getBehavior().getEdges().size());
 
             // 5. Start ACP server (blocks on stdin)
-            AcpAgentServer acpServer = new AcpAgentServer(graphRunner);
+            String systemRole = config.getProfile() != null ? config.getProfile().getSystemRole() : null;
+            AcpAgentServer acpServer = new AcpAgentServer(graphRunner, systemRole);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 log.info("Shutdown signal received");
                 acpServer.shutdown();
@@ -87,6 +91,26 @@ public class Main {
             log.error("Fatal error during startup", e);
             System.exit(2);
         }
+    }
+
+    /**
+     * Select the inference engine based on configuration.
+     * <ul>
+     *   <li>If a model path is configured and the file exists → DirectMlInferenceEngine</li>
+     *   <li>Otherwise → StubInferenceEngine</li>
+     * </ul>
+     */
+    static InferenceEngine createInferenceEngine(InferenceConfiguration inferenceConfig) {
+        if (inferenceConfig != null
+                && inferenceConfig.getModelPath() != null
+                && !inferenceConfig.getModelPath().isBlank()
+                && Files.exists(Path.of(inferenceConfig.getModelPath()))) {
+            log.info("Using DirectMlInferenceEngine (model={})", inferenceConfig.getModelPath());
+            return new DirectMlInferenceEngine(inferenceConfig);
+        }
+
+        log.info("No valid model path configured – using StubInferenceEngine");
+        return new StubInferenceEngine();
     }
 
     private static String resolveConfigPath(String[] args) {

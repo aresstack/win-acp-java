@@ -9,9 +9,6 @@ import org.slf4j.LoggerFactory;
  * Returns deterministic canned responses. This is <b>not</b> a real
  * inference backend – it exists so the rest of the stack can run
  * end-to-end without a model or GPU.
- * <p>
- * The real implementation (DirectML/D3D12 via FFM + jextract) will
- * replace this once the Windows bindings module is ready.
  */
 public class StubInferenceEngine implements InferenceEngine {
 
@@ -27,16 +24,18 @@ public class StubInferenceEngine implements InferenceEngine {
     }
 
     @Override
-    public InferenceResult infer(InferenceRequest request) throws InferenceException {
+    public InferenceResult generate(InferenceRequest request) throws InferenceException {
         if (!ready) throw new InferenceException("Engine not initialized");
 
-        log.debug("StubInferenceEngine: prompt length={} chars", request.getPrompt().length());
+        log.debug("StubInferenceEngine: prompt length={} chars", request.getUserPrompt().length());
 
         // Deterministic stub response
         String response = "[stub] I received your request but I am a stub inference engine. " +
                 "A real DirectML-based engine will replace me.";
 
-        return new InferenceResult(response, true, response.split("\\s+").length);
+        int wordCount = response.split("\\s+").length;
+        return new InferenceResult(response, "end_turn",
+                new InferenceResult.Usage(10, wordCount, 10 + wordCount));
     }
 
     @Override
@@ -50,4 +49,3 @@ public class StubInferenceEngine implements InferenceEngine {
         return ready;
     }
 }
-

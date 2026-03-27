@@ -25,6 +25,8 @@ public class AgentState {
     public static final String KEY_RESULT_SUFFICIENT = "resultSufficient";
     public static final String KEY_NEEDS_CLARIFICATION = "needsClarification";
     public static final String KEY_ERROR = "error";
+    public static final String KEY_SYSTEM_ROLE = "systemRole";
+    public static final String KEY_INFERENCE_TEXT = "inferenceText";
 
     private String userInput;
     private String currentGoal;
@@ -38,6 +40,8 @@ public class AgentState {
     private boolean resultSufficient;
     private boolean needsClarification;
     private String error;
+    private String systemRole;
+    private String inferenceText;
     private final List<ToolExecutionResult> toolResults = new ArrayList<>();
 
     // --- accessors ---
@@ -78,6 +82,12 @@ public class AgentState {
     public String getError() { return error; }
     public void setError(String error) { this.error = error; }
 
+    public String getSystemRole() { return systemRole; }
+    public void setSystemRole(String systemRole) { this.systemRole = systemRole; }
+
+    public String getInferenceText() { return inferenceText; }
+    public void setInferenceText(String inferenceText) { this.inferenceText = inferenceText; }
+
     public List<ToolExecutionResult> getToolResults() { return toolResults; }
     public ToolExecutionResult getLastToolResult() {
         return toolResults.isEmpty() ? null : toolResults.getLast();
@@ -100,6 +110,8 @@ public class AgentState {
         map.put(KEY_RESULT_SUFFICIENT, resultSufficient);
         map.put(KEY_NEEDS_CLARIFICATION, needsClarification);
         map.put(KEY_ERROR, error);
+        map.put(KEY_SYSTEM_ROLE, systemRole);
+        map.put(KEY_INFERENCE_TEXT, inferenceText);
         map.put(KEY_TOOL_RESULTS, new ArrayList<>(toolResults));
         return map;
     }
@@ -122,6 +134,8 @@ public class AgentState {
         state.resultSufficient = Boolean.TRUE.equals(map.get(KEY_RESULT_SUFFICIENT));
         state.needsClarification = Boolean.TRUE.equals(map.get(KEY_NEEDS_CLARIFICATION));
         state.error = (String) map.get(KEY_ERROR);
+        state.systemRole = (String) map.get(KEY_SYSTEM_ROLE);
+        state.inferenceText = (String) map.get(KEY_INFERENCE_TEXT);
         Object results = map.get(KEY_TOOL_RESULTS);
         if (results instanceof List<?> list) {
             for (Object item : list) {

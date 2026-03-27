@@ -6,4 +6,7 @@ dependencies {
 
     // JSON-RPC over stdio
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.1'
+
+    // Test: inference module needed for E2E tests with INFER node
+    testImplementation project(':win-acp-java-inference')
 }

@@ -5,12 +5,16 @@ package com.aresstack.winacp.config;
  */
 public class InferenceConfiguration {
 
+    private String modelId;
     private String modelPath;
-    private String backend = "directml";   // "directml" | "cpu"
+    private String backend = "directml";   // "directml" | "cpu" | "auto"
     private int maxTokens = 2048;
     private float temperature = 0.7f;
 
     public InferenceConfiguration() {}
+
+    public String getModelId() { return modelId; }
+    public void setModelId(String modelId) { this.modelId = modelId; }
 
     public String getModelPath() { return modelPath; }
     public void setModelPath(String modelPath) { this.modelPath = modelPath; }
@@ -24,4 +28,3 @@ public class InferenceConfiguration {
     public float getTemperature() { return temperature; }
     public void setTemperature(float temperature) { this.temperature = temperature; }
 }
-

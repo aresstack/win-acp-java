@@ -40,6 +40,9 @@ public enum NodeType {
     HANDLE_ERROR,
 
     /** Request human approval before continuing. */
-    REQUEST_APPROVAL
+    REQUEST_APPROVAL,
+
+    /** Run local inference to generate a response. */
+    INFER
 }
 

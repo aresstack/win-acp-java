@@ -33,10 +33,17 @@ public class LangGraphAgentRunner {
 
     private final AgentBehaviorDefinition behavior;
     private final Map<NodeType, AgentNode> nodeImplementations = new EnumMap<>(NodeType.class);
+    private com.aresstack.winacp.inference.InferenceEngine inferenceEngine;
 
     public LangGraphAgentRunner(AgentBehaviorDefinition behavior) {
         this.behavior = Objects.requireNonNull(behavior, "behavior");
     }
+
+    /** Inject the inference engine used by INFER nodes. */
+    public void setInferenceEngine(com.aresstack.winacp.inference.InferenceEngine inferenceEngine) {
+        this.inferenceEngine = inferenceEngine;
+    }
+
 
     /** Register a concrete implementation for a given node type. */
     public void registerNode(NodeType type, AgentNode node) {
@@ -56,6 +63,11 @@ public class LangGraphAgentRunner {
         registerNode(NodeType.FINALIZE,               DefaultNodes::finalize);
         registerNode(NodeType.HANDLE_ERROR,           DefaultNodes::handleError);
         registerNode(NodeType.REQUEST_APPROVAL,       DefaultNodes::requestApproval);
+
+        // INFER node: requires an InferenceEngine to be injected
+        if (inferenceEngine != null) {
+            registerNode(NodeType.INFER, DefaultNodes.inferNode(inferenceEngine));
+        }
     }
 
     /**
