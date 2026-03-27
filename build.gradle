@@ -25,6 +25,14 @@ subprojects {
     compileJava.options.encoding = 'UTF-8'
     compileTestJava.options.encoding = 'UTF-8'
 
+    // FFM (Foreign Function & Memory) is a preview feature in JDK 21.
+    compileJava.options.compilerArgs += ['--enable-preview']
+    compileTestJava.options.compilerArgs += ['--enable-preview']
+
+    tasks.withType(Test).configureEach {
+        jvmArgs '--enable-preview'
+    }
+
     repositories {
         mavenCentral()
     }
@@ -45,6 +53,8 @@ subprojects {
 
     javadoc {
         options.addStringOption('Xdoclint:none', '-quiet')
+        options.addBooleanOption('-enable-preview', true)
+        options.addStringOption('source', '21')
     }
 
     publishing {

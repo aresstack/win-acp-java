@@ -1,12 +1,83 @@
-// win-acp-java-windows-bindings – Windows native interop layer
+// win-acp-java-windows-bindings – FFM bindings for Windows SDK DLLs
 //
-// V1: Wraps ONNX Runtime (which uses DirectML as execution provider on Windows).
-// Future: jextract-generated raw FFM bindings for DXGI/D3D12/DirectML.
+// Hand-written Java 21 FFM (Foreign Function & Memory) bindings for:
+//   • dxgi.dll     – CreateDXGIFactory1, adapter enumeration
+//   • d3d12.dll    – D3D12CreateDevice, command queue creation
+//   • DirectML.dll – DMLCreateDevice
 //
 // All native details are confined to this module and must NOT leak outward.
 // No MemorySegment, MethodHandle, or FunctionDescriptor outside this module.
+//
+// The optional `jextract` task below can regenerate machine-generated
+// bindings from the Windows SDK headers (requires jextract on PATH).
 
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+// FFM (Foreign Function & Memory) is a preview feature in JDK 21.
+// --enable-preview is required for compilation and runtime.
+compileJava {
+    options.compilerArgs += ['--enable-preview']
+}
+
+compileTestJava {
+    options.compilerArgs += ['--enable-preview']
+}
+
+// No external dependencies – we link against Windows system DLLs via FFM.
 dependencies {
-    // ONNX Runtime – local inference with CPU and DirectML execution providers
-    implementation 'com.microsoft.onnxruntime:onnxruntime:1.20.0'
+    // (none – pure FFM, no third-party native libraries)
+}
+
+// ── JVM flags for native access ──────────────────────────────────────────
+tasks.withType(Test).configureEach {
+    jvmArgs '--enable-native-access=ALL-UNNAMED', '--enable-preview'
+}
+
+tasks.withType(JavaExec).configureEach {
+    jvmArgs '--enable-native-access=ALL-UNNAMED', '--enable-preview'
+}
+
+// ── Optional: jextract code-generation task ──────────────────────────────
+// Run with: ./gradlew :win-acp-java-windows-bindings:jextract
+// Requires: jextract on PATH and Windows SDK installed.
+
+def jextractBin = providers.systemProperty('jextract.path')
+        .orElse(providers.environmentVariable('JEXTRACT_HOME').map { "$it/bin/jextract" })
+        .orElse('jextract')
+
+def winSdkInclude = providers.systemProperty('winsdk.include')
+        .orElse('C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0')
+
+tasks.register('jextract') {
+    description = 'Generate FFM bindings from Windows SDK headers using jextract'
+    group = 'code generation'
+
+    def outputDir = layout.buildDirectory.dir('generated/sources/jextract/java')
+
+    outputs.dir(outputDir)
+
+    doLast {
+        def headers = [
+            [header: "${winSdkInclude.get()}/shared/dxgi.h",   pkg: 'com.aresstack.winacp.windows.gen.dxgi'],
+            [header: "${winSdkInclude.get()}/um/d3d12.h",      pkg: 'com.aresstack.winacp.windows.gen.d3d12'],
+            [header: "${winSdkInclude.get()}/um/DirectML.h",   pkg: 'com.aresstack.winacp.windows.gen.directml'],
+        ]
+
+        headers.each { entry ->
+            exec {
+                commandLine jextractBin.get(),
+                    '--source',
+                    '--output', outputDir.get().asFile.absolutePath,
+                    '-t', entry.pkg,
+                    '-I', "${winSdkInclude.get()}/shared",
+                    '-I', "${winSdkInclude.get()}/um",
+                    '-I', "${winSdkInclude.get()}/ucrt",
+                    entry.header
+            }
+        }
+    }
 }

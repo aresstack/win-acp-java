@@ -1,27 +1,33 @@
 package com.aresstack.winacp.inference;
 
 import com.aresstack.winacp.config.InferenceConfiguration;
-import com.aresstack.winacp.windows.OnnxRuntimeBridge;
-import com.aresstack.winacp.windows.OnnxRuntimeBridgeException;
+import com.aresstack.winacp.windows.WindowsBindings;
+import com.aresstack.winacp.windows.WindowsNativeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.file.Path;
-
 /**
- * Real inference engine backed by ONNX Runtime with DirectML (or CPU) provider.
+ * Inference engine backed by the Windows native stack (DXGI → D3D12 → DirectML).
  * <p>
- * V1 implementation: loads an ONNX model, runs a single forward pass,
- * and returns the output. Full auto-regressive LLM generation (tokenizer,
- * KV-cache, sampling loop) is <b>not yet included</b> – that is V2.
+ * Uses the {@link WindowsBindings} façade which calls directly into
+ * {@code dxgi.dll}, {@code d3d12.dll}, and {@code DirectML.dll}
+ * via Java 21 FFM (Foreign Function &amp; Memory API).
  * <p>
- * For V1, this engine proves the vertical slice:
+ * <b>No third-party inference runtime</b> (no ONNX Runtime, no wrapper libs).
+ * All native interop goes through the {@code win-acp-java-windows-bindings} module.
+ * <p>
+ * V1 proves the vertical slice: device creation, adapter enumeration,
+ * and DirectML device initialisation. Full operator dispatch (tensor
+ * creation, operator compilation, binding tables, command recording)
+ * is V2.
+ * <p>
+ * For V1, this engine proves:
  * <ol>
- *   <li>Model loaded ✓</li>
- *   <li>Session created ✓</li>
- *   <li>Input tensor submitted ✓</li>
- *   <li>Output tensor read ✓</li>
- *   <li>Result mapped to {@link InferenceResult} ✓</li>
+ *   <li>DXGI Factory created ✓</li>
+ *   <li>GPU adapter enumerated ✓</li>
+ *   <li>D3D12 device created ✓</li>
+ *   <li>DirectML device created ✓</li>
+ *   <li>Stack lifecycle (init/shutdown) ✓</li>
  * </ol>
  */
 public class DirectMlInferenceEngine implements InferenceEngine {
@@ -29,7 +35,7 @@ public class DirectMlInferenceEngine implements InferenceEngine {
     private static final Logger log = LoggerFactory.getLogger(DirectMlInferenceEngine.class);
 
     private final InferenceConfiguration config;
-    private OnnxRuntimeBridge bridge;
+    private WindowsBindings bindings;
     private boolean ready = false;
 
     public DirectMlInferenceEngine(InferenceConfiguration config) {
@@ -38,19 +44,20 @@ public class DirectMlInferenceEngine implements InferenceEngine {
 
     @Override
     public void initialize() throws InferenceException {
-        log.info("DirectMlInferenceEngine initializing (backend={}, model={})",
-                config.getBackend(), config.getModelPath());
+        log.info("DirectMlInferenceEngine initializing (backend={})", config.getBackend());
 
         try {
-            bridge = new OnnxRuntimeBridge();
-            bridge.loadModel(Path.of(config.getModelPath()), config.getBackend());
+            bindings = new WindowsBindings();
+            bindings.init(config.getBackend());
             ready = true;
 
-            log.info("DirectMlInferenceEngine ready (inputs={}, outputs={})",
-                    bridge.getInputNames(), bridge.getOutputNames());
+            log.info("DirectMlInferenceEngine ready (d3d12={}, directml={})",
+                    bindings.getD3d12Device() != null,
+                    bindings.hasDirectMl());
 
-        } catch (OnnxRuntimeBridgeException e) {
-            throw new InferenceException("Failed to initialize DirectML engine: " + e.getMessage(), e);
+        } catch (WindowsNativeException e) {
+            throw new InferenceException(
+                    "Failed to initialize DirectML engine: " + e.getMessage(), e);
         }
     }
 
@@ -62,44 +69,30 @@ public class DirectMlInferenceEngine implements InferenceEngine {
 
         log.debug("DirectMlInferenceEngine.generate: {}", request);
 
-        try {
-            // V1: simple forward pass with the prompt as token IDs
-            // In a full LLM pipeline, a tokenizer would convert text → tokens here.
-            // For V1, we convert the prompt to a naive byte/char encoding
-            // or use pre-tokenized input.
-            String fullPrompt = request.toFullPrompt();
-            long[] tokenIds = naiveTokenize(fullPrompt, request.getMaxTokens());
-            long[] shape = {1, tokenIds.length};
+        // V1: DirectML device is initialised. Full operator dispatch
+        // (DMLCreateOperator, DMLCompileOperator, IDMLCommandRecorder::RecordDispatch)
+        // is V2 scope. For now, return a diagnostic result proving the stack works.
+        String fullPrompt = request.toFullPrompt();
+        int promptTokens = fullPrompt.split("\\s+").length;
 
-            // Determine input tensor name
-            String inputName = bridge.getInputNames().stream()
-                    .findFirst()
-                    .orElseThrow(() -> new InferenceException("Model has no inputs"));
+        String resultText = String.format(
+                "[DirectML engine active: d3d12=%s, dml=%s, backend=%s] " +
+                        "Operator dispatch not yet implemented (V2). Prompt received: %d tokens.",
+                bindings.getD3d12Device() != null,
+                bindings.hasDirectMl(),
+                config.getBackend(),
+                promptTokens);
 
-            float[][] output = bridge.runForward(inputName, tokenIds, shape);
-
-            // V1: convert output logits to text via naive decoding
-            // A real tokenizer + sampling loop replaces this in V2.
-            String resultText = naiveDecode(output);
-
-            int completionTokens = resultText.split("\\s+").length;
-            int promptTokens = tokenIds.length;
-
-            return new InferenceResult(resultText, "end_turn",
-                    new InferenceResult.Usage(promptTokens, completionTokens,
-                            promptTokens + completionTokens));
-
-        } catch (OnnxRuntimeBridgeException e) {
-            throw new InferenceException("Inference failed: " + e.getMessage(), e);
-        }
+        return new InferenceResult(resultText, "end_turn",
+                new InferenceResult.Usage(promptTokens, 0, promptTokens));
     }
 
     @Override
     public void shutdown() {
         ready = false;
-        if (bridge != null) {
-            bridge.close();
-            bridge = null;
+        if (bindings != null) {
+            bindings.close();
+            bindings = null;
         }
         log.info("DirectMlInferenceEngine shut down");
     }
@@ -108,49 +101,4 @@ public class DirectMlInferenceEngine implements InferenceEngine {
     public boolean isReady() {
         return ready;
     }
-
-    // ---- V1 naive tokenizer/decoder (replaced by real tokenizer in V2) ----
-
-    /**
-     * Naive tokenization: each character becomes a token ID.
-     * Real implementation will use SentencePiece/BPE tokenizer.
-     */
-    private long[] naiveTokenize(String text, int maxTokens) {
-        int len = Math.min(text.length(), maxTokens);
-        long[] tokens = new long[len];
-        for (int i = 0; i < len; i++) {
-            tokens[i] = text.charAt(i);
-        }
-        return tokens;
-    }
-
-    /**
-     * Naive decoding: interpret output logits as character codes.
-     * Real implementation will use vocabulary-based decoding.
-     */
-    private String naiveDecode(float[][] output) {
-        if (output == null || output.length == 0 || output[0].length == 0) {
-            return "(empty model output)";
-        }
-
-        // For V1: return a description of the output shape
-        // A full decoder would argmax over vocab dimensions
-        StringBuilder sb = new StringBuilder();
-        float[] logits = output[0];
-
-        // Find top-5 indices as a diagnostic
-        sb.append("[DirectML output: ").append(logits.length).append(" logit values, ");
-        float max = Float.NEGATIVE_INFINITY;
-        int maxIdx = 0;
-        for (int i = 0; i < logits.length; i++) {
-            if (logits[i] > max) {
-                max = logits[i];
-                maxIdx = i;
-            }
-        }
-        sb.append("argmax=").append(maxIdx).append("]");
-
-        return sb.toString();
-    }
 }
-

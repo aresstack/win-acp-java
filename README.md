@@ -20,10 +20,10 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 │   Main entry point · wires all layers · starts ACP server   │
 ├──────────┬──────────┬──────────┬───────────┬────────────────┤
 │   acp    │  graph   │   mcp    │ inference │ windows-bind.  │
-│ ACP JSON │ LangGr.  │ MCP std  │ Inference │ jextract FFM   │
-│  -RPC /  │  4j be-  │  io cli- │ engine    │ bindings for   │
-│  stdio   │  havior  │  ent     │ (stub)    │ DirectML       │
-│  server  │  engine  │          │           │ (placeholder)  │
+│ ACP JSON │ LangGr.  │ MCP std  │ DirectML  │ FFM bindings   │
+│  -RPC /  │  4j be-  │  io cli- │ inference │ for dxgi.dll   │
+│  stdio   │  havior  │  ent     │ engine    │ d3d12.dll      │
+│  server  │  engine  │          │           │ DirectML.dll   │
 ├──────────┴──────────┴──────────┴───────────┴────────────────┤
 │                     win-acp-java-config                     │
 │  YAML config loading · validation · domain model            │
@@ -38,17 +38,18 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 | **acp** | ACP server: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/update` over JSON-RPC 2.0 / stdio | ✅ Implemented |
 | **graph** | LangGraph4j `StateGraph` – configurable agent behavior graph | ✅ Implemented |
 | **mcp** | MCP stdio client: `initialize`, `tools/list`, `tools/call` | ✅ Implemented (happy path) |
-| **inference** | Local inference engine abstraction | ⚠️ **Stub only** |
-| **windows-bindings** | jextract / FFM bindings for DXGI, D3D12, DirectML | ⚠️ **Placeholder only** |
+| **inference** | Local inference engine backed by Windows native stack | ✅ DirectML engine (V1: device init) |
+| **windows-bindings** | Hand-written FFM bindings for `dxgi.dll`, `d3d12.dll`, `DirectML.dll` – calls Windows SDK DLLs directly via Java 21 Foreign Function & Memory API | ✅ **FFM bindings implemented** |
 | **runtime** | Main entry point, wires all layers, `application` plugin | ✅ Implemented |
 
 ---
 
 ## Prerequisites
 
-- **Java 21+** (Temurin recommended)
-- **Gradle 8.x** (wrapper included)
-- Windows 11 (for future DirectML features; builds and tests run on any OS)
+- **Java 21+** (Zulu / Temurin recommended)
+- **Gradle 9.x** (wrapper included)
+- **Windows 11** with **Windows SDK 10.0.26100+** installed (for DirectML native bindings)
+- JVM flag `--enable-native-access=ALL-UNNAMED` and `--enable-preview` (set automatically by Gradle)
 
 ## Quick Start
 
@@ -64,7 +65,7 @@ cd win-acp-java
 ./gradlew :win-acp-java-runtime:run --args="--config application.yml"
 
 # Or directly via JAR
-java --enable-native-access=ALL-UNNAMED \
+java --enable-native-access=ALL-UNNAMED --enable-preview \
      -jar win-acp-java-runtime/build/libs/win-acp-java-runtime-0.1.0-SNAPSHOT.jar \
      --config application.yml
 ```
@@ -160,6 +161,15 @@ win-acp-java/
 | [Jackson](https://github.com/FasterXML/jackson) | 2.17.1 | JSON / YAML parsing |
 | [SLF4J](https://www.slf4j.org/) + [Logback](https://logback.qos.ch/) | 2.0.13 / 1.5.6 | Logging |
 | [JUnit 5](https://junit.org/junit5/) | 5.10.2 | Testing |
+| Java 21 FFM (Preview) | JDK built-in | Foreign Function & Memory API for Windows SDK DLL calls |
+
+### Windows SDK DLLs (loaded via FFM at runtime)
+
+| DLL | Purpose |
+|---|---|
+| `dxgi.dll` | DXGI Factory, GPU adapter enumeration |
+| `d3d12.dll` | Direct3D 12 device and command queue creation |
+| `DirectML.dll` | DirectML device creation for GPU-accelerated ML |
 
 ## Roadmap
 
@@ -169,17 +179,21 @@ win-acp-java/
 - MCP stdio client (`initialize`, `tools/list`, `tools/call`)
 - YAML configuration loading and validation
 - Inference engine abstraction with explicit stub
+- **FFM bindings for Windows SDK**: hand-written `Linker`/`FunctionDescriptor` calls to `dxgi.dll`, `d3d12.dll`, `DirectML.dll`
+- **DirectML inference engine V1**: DXGI→D3D12→DirectML device creation pipeline
+- `jextract` Gradle task for automated binding generation from Windows SDK headers
 - CI pipeline (GitHub Actions)
 - Gradle wrapper, multi-module build, Maven Central publishing skeleton
 
 ### 🔜 Next (planned)
-- [ ] Windows-Bindings: jextract-generated FFM bindings for DXGI / D3D12 / DirectML
-- [ ] Real inference engine implementation (DirectML backend)
+- [ ] DirectML operator dispatch: `DMLCreateOperator`, `CompileOperator`, `RecordDispatch`
+- [ ] jextract-generated FFM bindings to supplement hand-written ones
+- [ ] Tensor creation and buffer management via D3D12 resources
 - [ ] MCP robustness: error recovery, timeouts, reconnect
 - [ ] ACP streaming support (`session/update` with partial results)
 - [ ] ACP Java SDK integration (when available / stable)
 - [ ] Integration tests with real MCP tool servers
-- [ ] GGUF / ONNX model loading
+- [ ] GGUF / ONNX model loading (via FFM, not third-party runtime)
 
 ### 🔮 Future
 - [ ] GPU enumeration and selection

@@ -1,7 +1,11 @@
-// win-acp-java-inference – Local inference abstraction over Windows ML runtime
+// win-acp-java-inference – Local inference abstraction over Windows native stack (D3D12/DirectML)
 
 dependencies {
     api project(':win-acp-java-config')
     implementation project(':win-acp-java-windows-bindings')
 }
 
+// FFM native access is needed because the windows-bindings module uses it at runtime
+tasks.withType(Test).configureEach {
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+}

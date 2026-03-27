@@ -6,7 +6,7 @@ plugins {
 
 application {
     mainClass = 'com.aresstack.winacp.runtime.Main'
-    applicationDefaultJvmArgs = ['--enable-native-access=ALL-UNNAMED']
+    applicationDefaultJvmArgs = ['--enable-native-access=ALL-UNNAMED', '--enable-preview']
 }
 
 run {
