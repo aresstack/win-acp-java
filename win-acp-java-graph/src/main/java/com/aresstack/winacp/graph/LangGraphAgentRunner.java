@@ -2,6 +2,7 @@ package com.aresstack.winacp.graph;
 
 import com.aresstack.winacp.config.*;
 import org.bsc.langgraph4j.StateGraph;
+import org.bsc.langgraph4j.CompileConfig;
 import org.bsc.langgraph4j.CompiledGraph;
 import org.bsc.langgraph4j.GraphStateException;
 import org.bsc.langgraph4j.action.AsyncNodeAction;
@@ -65,8 +66,10 @@ public class LangGraphAgentRunner {
      */
     public AgentState run(AgentState initialState) {
         try {
-            CompiledGraph<org.bsc.langgraph4j.state.AgentState> compiled = buildGraph();
-            compiled.setMaxIterations(behavior.getMaxIterations());
+            CompileConfig config = CompileConfig.builder()
+                    .recursionLimit(behavior.getMaxIterations())
+                    .build();
+            CompiledGraph<org.bsc.langgraph4j.state.AgentState> compiled = buildGraph(config);
 
             Map<String, Object> input = initialState.toMap();
             log.info("LangGraph4j execution starting at '{}'", behavior.getStartNode());
@@ -95,7 +98,7 @@ public class LangGraphAgentRunner {
 
     // ---- internal graph construction ----
 
-    private CompiledGraph<org.bsc.langgraph4j.state.AgentState> buildGraph() throws GraphStateException {
+    private CompiledGraph<org.bsc.langgraph4j.state.AgentState> buildGraph(CompileConfig config) throws GraphStateException {
         StateGraph<org.bsc.langgraph4j.state.AgentState> graph =
                 new StateGraph<>(org.bsc.langgraph4j.state.AgentState::new);
 
@@ -158,7 +161,7 @@ public class LangGraphAgentRunner {
             }
         }
 
-        return graph.compile();
+        return graph.compile(config);
     }
 
     private AsyncNodeAction<org.bsc.langgraph4j.state.AgentState> wrapAsLg4jAction(
