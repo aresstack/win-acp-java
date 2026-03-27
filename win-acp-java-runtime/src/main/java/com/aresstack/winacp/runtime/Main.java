@@ -96,9 +96,10 @@ public class Main {
     /**
      * Select the inference engine based on configuration.
      * <p>
-     * <b>V1:</b> Only {@code mnist-8.onnx} is supported. If the configured
-     * model path exists → {@link MnistDirectMlEngine}, otherwise fallback
-     * to {@link StubInferenceEngine}.
+     * <b>V1:</b> MNIST-family CNN models (currently validated with
+     * {@code mnist-12.onnx}). If the configured model path exists →
+     * {@link MnistDirectMlEngine}, otherwise fallback to
+     * {@link StubInferenceEngine}.
      */
     static InferenceEngine createInferenceEngine(InferenceConfiguration inferenceConfig) {
         if (inferenceConfig != null

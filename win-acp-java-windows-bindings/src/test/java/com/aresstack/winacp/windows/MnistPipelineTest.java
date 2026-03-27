@@ -13,7 +13,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Tests for the minimal ONNX protobuf parser and the MNIST DirectML pipeline.
  * <p>
- * The MNIST model file is expected at {@code model/mnist-8.onnx} relative to the project root.
+ * V1 scope: MNIST-family CNN vertical slice, currently validated with
+ * {@code mnist-12.onnx} (opset 12). The model file is expected at
+ * {@code model/mnist-12.onnx} relative to the project root.
  * Tests that require the model are skipped if the file is not present.
  */
 class MnistPipelineTest {
@@ -23,14 +25,14 @@ class MnistPipelineTest {
     private static Path findModelPath() {
         // Try relative paths from different working directories
         for (String candidate : new String[]{
-                "model/mnist-8.onnx",
-                "../model/mnist-8.onnx",
-                "../../model/mnist-8.onnx"
+                "model/mnist-12.onnx",
+                "../model/mnist-12.onnx",
+                "../../model/mnist-12.onnx"
         }) {
             Path p = Path.of(candidate);
             if (Files.exists(p)) return p;
         }
-        return Path.of("model/mnist-8.onnx"); // default, may not exist
+        return Path.of("model/mnist-12.onnx"); // default, may not exist
     }
 
     static boolean modelExists() {
@@ -41,7 +43,7 @@ class MnistPipelineTest {
 
     @Test
     @EnabledIf("modelExists")
-    void onnxParser_canParseMnist8() throws Exception {
+    void onnxParser_canParseMnistModel() throws Exception {
         var graph = OnnxModelReader.parse(MODEL_PATH);
         assertNotNull(graph);
         assertFalse(graph.nodes().isEmpty(), "Graph should have nodes");

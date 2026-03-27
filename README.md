@@ -12,16 +12,18 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 
 ---
 
-## V1 Scope – MNIST · DirectML · Vertical Slice
+## V1 Scope – MNIST-family CNN · DirectML · Vertical Slice
 
-**V1 is a deliberate vertical slice:** one model (`mnist-8.onnx`), one
-hardware path (DirectML on the GPU), one classification task (digit 0–9).
+**V1 is a deliberate vertical slice:** MNIST-family CNN digit classification,
+one hardware path (DirectML on the GPU), one task (digit 0–9).
+Currently validated with `mnist-12.onnx` (opset 12); also compatible with
+`mnist-8.onnx` (opset 8).
 
 The entire stack – from Java 21 FFM calls through DXGI → D3D12 → DirectML →
-operator dispatch → argmax – is proven end-to-end with this single model.
-**No other ONNX models are supported in V1.** Generalized ONNX operator
-coverage and text-generation / chat model support are future milestones
-that will be tackled *after* the native layer is hardened and stable.
+operator dispatch → argmax – is proven end-to-end with this model family.
+**No other ONNX model architectures are supported in V1.** Generalized ONNX
+operator coverage and text-generation / chat model support are future
+milestones that will be tackled *after* the native layer is hardened and stable.
 
 ---
 
@@ -51,8 +53,8 @@ that will be tackled *after* the native layer is hardened and stable.
 | **acp** | ACP server: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/update` over JSON-RPC 2.0 / stdio | ✅ Implemented |
 | **graph** | LangGraph4j `StateGraph` – configurable agent behavior graph | ✅ Implemented |
 | **mcp** | MCP stdio client: `initialize`, `tools/list`, `tools/call` | ✅ Implemented (happy path) |
-| **inference** | MNIST digit classification via DirectML (V1 vertical slice) | ✅ `MnistDirectMlEngine` working end-to-end |
-| **windows-bindings** | Hand-written FFM bindings for `dxgi.dll`, `d3d12.dll`, `DirectML.dll` – calls Windows SDK DLLs directly via Java 21 Foreign Function & Memory API | ✅ **MNIST inference via DirectML – full GPU pipeline working** |
+| **inference** | MNIST digit classification via DirectML (V1 vertical slice) | ✅ `MnistDirectMlEngine` working end-to-end (mnist-12) |
+| **windows-bindings** | Hand-written FFM bindings for `dxgi.dll`, `d3d12.dll`, `DirectML.dll` – calls Windows SDK DLLs directly via Java 21 Foreign Function & Memory API | ✅ **MNIST inference via DirectML – full GPU pipeline working (mnist-8 + mnist-12)** |
 | **runtime** | Main entry point, wires all layers, `application` plugin | ✅ Implemented |
 
 ---
@@ -109,9 +111,9 @@ behavior:
     - { from: goal,    to: respond,  condition: TOOL_NOT_REQUIRED }
     - { from: respond, to: finalize, condition: ALWAYS }
 
-# V1: only mnist-8.onnx is supported
+# V1: MNIST-family CNN models supported (currently validated with mnist-12.onnx)
 inference:
-  modelPath: model/mnist-8.onnx
+  modelPath: model/mnist-12.onnx
   backend: directml
 ```
 
@@ -156,7 +158,7 @@ win-acp-java/
 ├── settings.gradle               # Module includes
 ├── application.yml               # Default agent configuration
 ├── agent.example.yaml            # Annotated example configuration
-├── model/mnist-8.onnx            # MNIST model (the only model V1 supports)
+├── model/mnist-12.onnx            # MNIST model (V1 primary – opset 12)
 ├── win-acp-java-config/          # Configuration & domain model
 ├── win-acp-java-acp/             # ACP JSON-RPC server
 ├── win-acp-java-graph/           # LangGraph4j behavior engine
@@ -184,10 +186,13 @@ win-acp-java/
 | `d3d12.dll` | Direct3D 12 device, command queues, buffers, descriptor heaps, fences |
 | `DirectML.dll` | DirectML operator creation, compilation, dispatch, binding tables |
 
-## MNIST DirectML Pipeline (V1 – the only supported model)
+## MNIST DirectML Pipeline (V1 – MNIST-family CNN vertical slice)
 
 The `windows-bindings` module implements a complete GPU inference pipeline for
-[`mnist-8.onnx`](model/mnist-8.onnx) using **only** Java 21 FFM calls to Windows system DLLs:
+MNIST-family CNN models (currently validated with
+[`mnist-12.onnx`](model/mnist-12.onnx), also compatible with
+[`mnist-8.onnx`](model/mnist-8.onnx)) using **only** Java 21 FFM calls to
+Windows system DLLs:
 
 ```
 Input (784 floats, 28×28)
@@ -216,14 +221,15 @@ Output: predicted digit 0–9
 - YAML configuration loading and validation
 - Inference engine abstraction with explicit stub fallback
 - **FFM bindings for Windows SDK**: hand-written `Linker`/`FunctionDescriptor` calls to `dxgi.dll`, `d3d12.dll`, `DirectML.dll`
-- **MNIST end-to-end GPU inference**: `mnist-8.onnx` parsed, operators created, compiled and dispatched entirely via DirectML – Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm → argmax
+- **MNIST end-to-end GPU inference**: MNIST-family models (mnist-12, mnist-8) parsed, operators created, compiled and dispatched entirely via DirectML – Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm → argmax
 - **DirectML inference engine**: DXGI→D3D12→DirectML device creation, descriptor heaps, binding tables, command recording, GPU synchronization
 - Deterministic multi-run consistency verified
 - CI pipeline (GitHub Actions)
 - Gradle wrapper, multi-module build, Maven Central publishing skeleton
 
-> **V1 scope**: Only `mnist-8.onnx` is supported. This is a deliberate
-> vertical slice to prove the pure-Java FFM → DirectML stack end-to-end.
+> **V1 scope**: MNIST-family CNN vertical slice, currently validated with
+> `mnist-12.onnx` (opset 12). This is a deliberate vertical slice to prove
+> the pure-Java FFM → DirectML stack end-to-end.
 
 ### 🔧 Hardening (current focus)
 - [ ] COM lifecycle hardening (double-close guards, null-safe release)

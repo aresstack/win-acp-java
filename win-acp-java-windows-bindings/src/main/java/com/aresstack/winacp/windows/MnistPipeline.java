@@ -11,7 +11,10 @@ import java.util.*;
 /**
  * MNIST-specific DirectML inference pipeline.
  * <p>
- * Loads {@code mnist-8.onnx}, creates DirectML operators for each layer,
+ * V1 scope: MNIST-family CNN vertical slice, currently validated with
+ * {@code mnist-12.onnx} (opset 12). Also compatible with {@code mnist-8.onnx}.
+ * <p>
+ * Loads the ONNX model, creates DirectML operators for each layer,
  * and runs inference entirely on the GPU via D3D12 + DirectML.
  * <p>
  * Network: Input(1,1,28,28) → Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm → Output(1,10)
@@ -107,10 +110,11 @@ public final class MnistPipeline implements AutoCloseable {
             }
         }
 
-        // MNIST-8 graph structure (from CNTK):
+        // MNIST graph structure (CNTK-based, opset 8 and 12):
         //   Conv(input, filter) → Add(_, bias) → Relu → MaxPool  (×2)
         //   Reshape → MatMul(_, weight) → Add(_, bias) → output
         // Conv nodes have NO bias input; bias is in the following Add node.
+        // (mnist-12 reorders Reshape nodes but weight extraction is identical.)
 
         List<float[]> convFilters = new ArrayList<>();
         List<float[]> convBiases = new ArrayList<>();

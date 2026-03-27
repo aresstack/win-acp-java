@@ -11,7 +11,8 @@ import java.nio.file.Path;
 import java.util.*;
 
 /**
- * Minimal ONNX protobuf reader – parses only what is needed for mnist-8.onnx.
+ * Minimal ONNX protobuf reader – parses what is needed for MNIST-family models
+ * (validated with {@code mnist-12.onnx} and {@code mnist-8.onnx}).
  * <p>
  * No dependency on Google Protobuf or any ONNX library.
  * Hand-written decoder for the ONNX wire format (protobuf3).

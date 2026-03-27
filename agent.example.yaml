@@ -67,9 +67,9 @@ approvalPolicy:
   approvalRequiredByDefault: false
 
 # V1 inference: MNIST digit classification via DirectML.
-# Only mnist-8.onnx is supported. No text generation / chat models yet.
+# Currently validated with mnist-12.onnx. No text generation / chat models yet.
 inference:
-  modelPath: model/mnist-8.onnx
+  modelPath: model/mnist-12.onnx
   backend: directml
 
 logLevel: INFO
