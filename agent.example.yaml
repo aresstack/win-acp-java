@@ -1,5 +1,8 @@
-# win-acp-java – Example Agent Configuration
-# Place this file next to the agent JAR or pass via --config / WIN_ACP_CONFIG
+# win-acp-java – Default Agent Configuration
+#
+# This file is shipped with the repo and works out of the box.
+# To customize: copy to 'application.yml' (gitignored) and edit.
+# Or pass any YAML file via --config <path> or WIN_ACP_CONFIG env var.
 
 profile:
   id: default

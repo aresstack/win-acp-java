@@ -76,21 +76,24 @@ cd win-acp-java
 # Build + test
 ./gradlew clean build
 
-# Run the agent (listens on stdio for ACP JSON-RPC)
-./gradlew :win-acp-java-runtime:run --args="--config application.yml"
+# Run the agent (uses agent.example.yaml by default)
+./gradlew :win-acp-java-runtime:run
+
+# Or explicitly pass a config
+./gradlew :win-acp-java-runtime:run --args="--config agent.example.yaml"
 
 # Or directly via JAR
 java --enable-native-access=ALL-UNNAMED --enable-preview \
-     -jar win-acp-java-runtime/build/libs/win-acp-java-runtime-0.1.0-SNAPSHOT.jar \
-     --config application.yml
+     -jar win-acp-java-runtime/build/libs/win-acp-java-runtime-0.1.0-SNAPSHOT.jar
 ```
 
 On **Windows** use `gradlew.bat` instead of `./gradlew`.
 
 ## Configuration
 
-The agent is configured via a single YAML file. See [`agent.example.yaml`](agent.example.yaml)
-for a fully annotated example.
+The agent is configured via a YAML file. The repo ships
+[`agent.example.yaml`](agent.example.yaml) which works out of the box.
+To customize, copy it to `application.yml` (gitignored) and edit as needed.
 
 ```yaml
 profile:
@@ -117,10 +120,11 @@ inference:
   backend: directml
 ```
 
-Configuration can be passed via:
-- `--config <path>` CLI argument
-- `WIN_ACP_CONFIG` environment variable
-- Falls back to `application.yml` in the working directory
+Configuration resolution order:
+1. `--config <path>` CLI argument
+2. `WIN_ACP_CONFIG` environment variable
+3. `application.yml` in working directory (local override, gitignored)
+4. `agent.example.yaml` in working directory (shipped with repo)
 
 ## ACP Protocol
 
@@ -156,9 +160,10 @@ Tool servers are configured in the YAML under `mcp.servers`.
 win-acp-java/
 ├── build.gradle                  # Root build: allprojects config, publishing
 ├── settings.gradle               # Module includes
-├── application.yml               # Default agent configuration
-├── agent.example.yaml            # Annotated example configuration
-├── model/mnist-12.onnx            # MNIST model (V1 primary – opset 12)
+├── agent.example.yaml            # Default configuration (shipped, works out of the box)
+├── model/
+│   ├── mnist-12.onnx             # MNIST model – V1 primary (opset 12, 26 KB)
+│   └── mnist-8.onnx              # MNIST model – also supported (opset 8, 26 KB)
 ├── win-acp-java-config/          # Configuration & domain model
 ├── win-acp-java-acp/             # ACP JSON-RPC server
 ├── win-acp-java-graph/           # LangGraph4j behavior engine

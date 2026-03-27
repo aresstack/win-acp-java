@@ -21,4 +21,3 @@ Thumbs.db
 
 # Local configuration (use agent.example.yaml as template)
 application.yml
-/model/

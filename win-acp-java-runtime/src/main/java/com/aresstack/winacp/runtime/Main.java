@@ -22,13 +22,17 @@ import java.util.List;
  * validates it, wires all layers, and enters the ACP message loop.
  *
  * <pre>
- * java --enable-native-access=ALL-UNNAMED -jar win-acp-java-runtime.jar --config application.yml
+ * java --enable-native-access=ALL-UNNAMED -jar win-acp-java-runtime.jar --config agent.example.yaml
  * </pre>
  */
 public class Main {
 
     private static final Logger log = LoggerFactory.getLogger(Main.class);
-    private static final String DEFAULT_CONFIG = "application.yml";
+
+    /** User-specific local config (gitignored). */
+    private static final String LOCAL_CONFIG = "application.yml";
+    /** Shipped example config (always present in the repo). */
+    private static final String EXAMPLE_CONFIG = "agent.example.yaml";
 
     public static void main(String[] args) {
         log.info("win-acp-java 0.1.0-SNAPSHOT starting");
@@ -114,12 +118,28 @@ public class Main {
         return new StubInferenceEngine();
     }
 
-    private static String resolveConfigPath(String[] args) {
+    /**
+     * Resolve configuration path.
+     * <p>
+     * Fallback chain:
+     * <ol>
+     *   <li>{@code --config <path>} CLI argument</li>
+     *   <li>{@code WIN_ACP_CONFIG} environment variable</li>
+     *   <li>{@code application.yml} in working directory (local override, gitignored)</li>
+     *   <li>{@code agent.example.yaml} in working directory (shipped with repo)</li>
+     * </ol>
+     */
+    static String resolveConfigPath(String[] args) {
+        // 1. Explicit --config argument
         for (int i = 0; i < args.length - 1; i++) {
             if ("--config".equals(args[i])) return args[i + 1];
         }
+        // 2. Environment variable
         String env = System.getenv("WIN_ACP_CONFIG");
         if (env != null && !env.isBlank()) return env;
-        return DEFAULT_CONFIG;
+        // 3. Local config (gitignored)
+        if (Files.exists(Path.of(LOCAL_CONFIG))) return LOCAL_CONFIG;
+        // 4. Shipped example
+        return EXAMPLE_CONFIG;
     }
 }

@@ -31,11 +31,10 @@ public class ConfigLoader {
                     "Configuration file not found: " + path.toAbsolutePath() + "\n" +
                     "\n" +
                     "Please provide a valid configuration file. Options:\n" +
-                    "  1. Place an 'application.yml' in the working directory\n" +
-                    "  2. Pass --config <path> as command-line argument\n" +
-                    "  3. Set the environment variable WIN_ACP_CONFIG=<path>\n" +
-                    "\n" +
-                    "A sample configuration is available at: agent.example.yaml"
+                    "  1. Use the shipped 'agent.example.yaml' (works out of the box)\n" +
+                    "  2. Copy 'agent.example.yaml' to 'application.yml' and customize\n" +
+                    "  3. Pass --config <path> as command-line argument\n" +
+                    "  4. Set the environment variable WIN_ACP_CONFIG=<path>"
             );
         }
 
