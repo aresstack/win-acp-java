@@ -27,18 +27,19 @@ public final class DirectMlBindings {
     public static final int DML_TENSOR_DATA_TYPE_FLOAT32 = 1;
 
     // DML_TENSOR_TYPE
-    public static final int DML_TENSOR_TYPE_BUFFER = 0;
+    public static final int DML_TENSOR_TYPE_INVALID = 0;
+    public static final int DML_TENSOR_TYPE_BUFFER = 1;
 
     // DML_TENSOR_FLAGS
     public static final int DML_TENSOR_FLAG_NONE = 0;
 
-    // DML_OPERATOR_TYPE values (from DirectML.h)
+    // DML_OPERATOR_TYPE values (from DirectML.h – Windows SDK 10.0.26100.0)
     public static final int DML_OPERATOR_ELEMENT_WISE_IDENTITY = 1;
-    public static final int DML_OPERATOR_ACTIVATION_RELU       = 18;
-    public static final int DML_OPERATOR_CONVOLUTION            = 31;
-    public static final int DML_OPERATOR_GEMM                   = 32;
-    public static final int DML_OPERATOR_MAX_POOLING             = 40;
-    public static final int DML_OPERATOR_ELEMENT_WISE_ADD        = 7;
+    public static final int DML_OPERATOR_ELEMENT_WISE_ADD        = 4;
+    public static final int DML_OPERATOR_ACTIVATION_RELU       = 44;
+    public static final int DML_OPERATOR_CONVOLUTION            = 53;
+    public static final int DML_OPERATOR_GEMM                   = 54;
+    public static final int DML_OPERATOR_MAX_POOLING             = 58;
 
     // DML_CONVOLUTION_MODE / DIRECTION
     public static final int DML_CONVOLUTION_MODE_CROSS_CORRELATION = 0;
@@ -344,12 +345,12 @@ public final class DirectMlBindings {
         desc.set(ValueLayout.JAVA_INT, 4, DML_TENSOR_FLAG_NONE);
         desc.set(ValueLayout.JAVA_INT, 8, sizes.length);
         // sizes array
-        MemorySegment sizesPtr = arena.allocate(ValueLayout.JAVA_INT, sizes.length);
+        MemorySegment sizesPtr = arena.allocate((long) sizes.length * ValueLayout.JAVA_INT.byteSize(), 4);
         for (int i = 0; i < sizes.length; i++) sizesPtr.setAtIndex(ValueLayout.JAVA_INT, i, sizes[i]);
         desc.set(ValueLayout.ADDRESS, 16, sizesPtr);
         // strides (optional)
         if (strides != null) {
-            MemorySegment stridesPtr = arena.allocate(ValueLayout.JAVA_INT, strides.length);
+            MemorySegment stridesPtr = arena.allocate((long) strides.length * ValueLayout.JAVA_INT.byteSize(), 4);
             for (int i = 0; i < strides.length; i++) stridesPtr.setAtIndex(ValueLayout.JAVA_INT, i, strides[i]);
             desc.set(ValueLayout.ADDRESS, 24, stridesPtr);
         } else {

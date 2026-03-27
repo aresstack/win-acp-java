@@ -91,29 +91,59 @@ public final class MnistPipeline implements AutoCloseable {
     private void extractWeights(OnnxModelReader.OnnxGraph graph) {
         Map<String, OnnxModelReader.OnnxTensor> inits = graph.initializers();
 
-        // Walk nodes to find Conv and MatMul/Add weight names
+        // Build maps for tracing data flow
+        Map<String, String> reshapeMap = new HashMap<>(); // reshape output → reshape input
+        Map<String, String> outputToNode = new HashMap<>(); // tensor name → producing node's opType
+
+        for (OnnxModelReader.OnnxNode node : graph.nodes()) {
+            if ("Reshape".equals(node.opType()) && !node.inputs().isEmpty() && !node.outputs().isEmpty()) {
+                reshapeMap.put(node.outputs().get(0), node.inputs().get(0));
+            }
+            for (String out : node.outputs()) {
+                outputToNode.put(out, node.opType());
+            }
+        }
+
+        // MNIST-8 graph structure (from CNTK):
+        //   Conv(input, filter) → Add(_, bias) → Relu → MaxPool  (×2)
+        //   Reshape → MatMul(_, weight) → Add(_, bias) → output
+        // Conv nodes have NO bias input; bias is in the following Add node.
+
         List<float[]> convFilters = new ArrayList<>();
         List<float[]> convBiases = new ArrayList<>();
         float[] matMulWeight = null;
         float[] addBias = null;
 
-        for (OnnxModelReader.OnnxNode node : graph.nodes()) {
+        var nodes = graph.nodes();
+        for (int i = 0; i < nodes.size(); i++) {
+            var node = nodes.get(i);
             switch (node.opType()) {
                 case "Conv" -> {
-                    OnnxModelReader.OnnxTensor f = inits.get(node.inputs().get(1));
-                    OnnxModelReader.OnnxTensor b = node.inputs().size() > 2 ? inits.get(node.inputs().get(2)) : null;
+                    OnnxModelReader.OnnxTensor f = resolveInitializer(node.inputs().get(1), inits, reshapeMap);
                     convFilters.add(f != null ? f.data() : new float[0]);
-                    convBiases.add(b != null ? b.data() : new float[0]);
+
+                    // Look ahead for the Add node that provides the bias
+                    float[] bias = null;
+                    if (i + 1 < nodes.size() && "Add".equals(nodes.get(i + 1).opType())) {
+                        var addNode = nodes.get(i + 1);
+                        for (String in : addNode.inputs()) {
+                            OnnxModelReader.OnnxTensor t = resolveInitializer(in, inits, reshapeMap);
+                            if (t != null) { bias = t.data(); break; }
+                        }
+                    }
+                    convBiases.add(bias != null ? bias : new float[0]);
                 }
                 case "MatMul" -> {
-                    OnnxModelReader.OnnxTensor w = inits.get(node.inputs().get(1));
+                    OnnxModelReader.OnnxTensor w = resolveInitializer(node.inputs().get(1), inits, reshapeMap);
                     if (w != null) matMulWeight = w.data();
                 }
                 case "Add" -> {
-                    // bias is whichever input is in initializers
-                    for (String in : node.inputs()) {
-                        OnnxModelReader.OnnxTensor t = inits.get(in);
-                        if (t != null) { addBias = t.data(); break; }
+                    // Only capture the final Add (after MatMul) as FC bias
+                    if (matMulWeight != null && addBias == null) {
+                        for (String in : node.inputs()) {
+                            OnnxModelReader.OnnxTensor t = resolveInitializer(in, inits, reshapeMap);
+                            if (t != null) { addBias = t.data(); break; }
+                        }
                     }
                 }
             }
@@ -496,20 +526,25 @@ public final class MnistPipeline implements AutoCloseable {
      */
     private MemorySegment createAndCompileConv(int[] inShape, int[] filterShape, int[] biasShape,
                                                 int[] outShape, int[] strides, int[] padStart,
-                                                int[] padEnd, boolean fuseRelu)
+                                                int[] padEnd, boolean fuseRelu,
+                                                boolean hasBias)
             throws WindowsNativeException {
         var dml = wb.getDmlDevice();
 
         var inTD = td(inShape);
         var filterTD = td(filterShape);
-        var biasTD = td(biasShape);
         var outTD = td(outShape);
 
         // DML_CONVOLUTION_OPERATOR_DESC: 104 bytes
         MemorySegment conv = arena.allocate(104, 8);
         conv.set(ValueLayout.ADDRESS, 0, inTD);          // InputTensor
         conv.set(ValueLayout.ADDRESS, 8, filterTD);       // FilterTensor
-        conv.set(ValueLayout.ADDRESS, 16, biasTD);        // BiasTensor
+        if (hasBias) {
+            var biasTD = td(biasShape);
+            conv.set(ValueLayout.ADDRESS, 16, biasTD);    // BiasTensor
+        } else {
+            conv.set(ValueLayout.ADDRESS, 16, MemorySegment.NULL); // No bias
+        }
         conv.set(ValueLayout.ADDRESS, 24, outTD);          // OutputTensor
         conv.set(ValueLayout.JAVA_INT, 32, DirectMlBindings.DML_CONVOLUTION_MODE_CROSS_CORRELATION);
         conv.set(ValueLayout.JAVA_INT, 36, DirectMlBindings.DML_CONVOLUTION_DIRECTION_FORWARD);
@@ -628,9 +663,28 @@ public final class MnistPipeline implements AutoCloseable {
 
     /** Allocate a native int[] array. */
     private MemorySegment allocInts(int[] values) {
-        MemorySegment seg = arena.allocate(ValueLayout.JAVA_INT, values.length);
+        MemorySegment seg = arena.allocate((long) values.length * ValueLayout.JAVA_INT.byteSize(), 4);
         for (int i = 0; i < values.length; i++) seg.setAtIndex(ValueLayout.JAVA_INT, i, values[i]);
         return seg;
+    }
+
+    /** Resolve a tensor name through Reshape chain to find the actual initializer. */
+    private static OnnxModelReader.OnnxTensor resolveInitializer(
+            String name, Map<String, OnnxModelReader.OnnxTensor> inits,
+            Map<String, String> reshapeMap) {
+        // Direct lookup first
+        OnnxModelReader.OnnxTensor t = inits.get(name);
+        if (t != null) return t;
+        // Trace through Reshape outputs → inputs
+        String traced = name;
+        for (int i = 0; i < 5 && traced != null; i++) {
+            traced = reshapeMap.get(traced);
+            if (traced != null) {
+                t = inits.get(traced);
+                if (t != null) return t;
+            }
+        }
+        return null;
     }
 
     /** Float byte size. */

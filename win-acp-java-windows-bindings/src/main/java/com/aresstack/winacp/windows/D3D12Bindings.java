@@ -122,7 +122,7 @@ public final class D3D12Bindings {
     public static MemorySegment createCommandQueue(MemorySegment device, Arena arena)
             throws WindowsNativeException {
         try {
-            MemorySegment desc = arena.allocate(16);
+            MemorySegment desc = arena.allocate(16, 4);
             desc.set(ValueLayout.JAVA_INT, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
             desc.set(ValueLayout.JAVA_INT, 4, 0);
             desc.set(ValueLayout.JAVA_INT, 8, 0);
@@ -243,7 +243,7 @@ public final class D3D12Bindings {
     public static void uavBarrier(MemorySegment cmdList, Arena arena) {
         try {
             // D3D12_RESOURCE_BARRIER for UAV: Type=2, Flags=0, UAV.pResource=NULL
-            MemorySegment barrier = arena.allocate(32); // max barrier struct size
+            MemorySegment barrier = arena.allocate(32, 8); // max barrier struct size
             barrier.set(ValueLayout.JAVA_INT, 0, D3D12_RESOURCE_BARRIER_TYPE_UAV);
             barrier.set(ValueLayout.JAVA_INT, 4, D3D12_RESOURCE_BARRIER_FLAG_NONE);
             barrier.set(ValueLayout.ADDRESS, 8, MemorySegment.NULL); // UAV.pResource = NULL = all
@@ -261,7 +261,7 @@ public final class D3D12Bindings {
     public static void transitionBarrier(MemorySegment cmdList, MemorySegment resource,
                                           int stateBefore, int stateAfter, Arena arena) {
         try {
-            MemorySegment barrier = arena.allocate(32);
+            MemorySegment barrier = arena.allocate(32, 8);
             barrier.set(ValueLayout.JAVA_INT, 0, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION);
             barrier.set(ValueLayout.JAVA_INT, 4, D3D12_RESOURCE_BARRIER_FLAG_NONE);
             barrier.set(ValueLayout.ADDRESS, 8, resource);
@@ -308,13 +308,16 @@ public final class D3D12Bindings {
                                               long sizeBytes, int resFlags, int initState,
                                               Arena arena) throws WindowsNativeException {
         try {
+            // D3D12 needs minimum buffer size; DML commonly requires >= 4 bytes
+            sizeBytes = Math.max(sizeBytes, 4);
+
             // D3D12_HEAP_PROPERTIES: {Type(4), CPUPageProp(4), MemPoolPref(4), CreationNodeMask(4), VisibleNodeMask(4)} = 20 bytes
-            MemorySegment heapProps = arena.allocate(20);
+            MemorySegment heapProps = arena.allocate(24, 8);
             heapProps.set(ValueLayout.JAVA_INT, 0, heapType);
             // rest are 0 (default CPU page, default memory pool, node masks)
 
             // D3D12_RESOURCE_DESC for BUFFER: 56 bytes with alignment
-            MemorySegment resDesc = arena.allocate(56);
+            MemorySegment resDesc = arena.allocate(56, 8);
             resDesc.set(ValueLayout.JAVA_INT, 0, D3D12_RESOURCE_DIMENSION_BUFFER); // Dimension
             resDesc.set(ValueLayout.JAVA_LONG, 8, 0L);        // Alignment (default)
             resDesc.set(ValueLayout.JAVA_LONG, 16, sizeBytes); // Width = size
@@ -418,7 +421,7 @@ public final class D3D12Bindings {
                                                       Arena arena) throws WindowsNativeException {
         try {
             // D3D12_DESCRIPTOR_HEAP_DESC: {Type(4), NumDescriptors(4), Flags(4), NodeMask(4)} = 16 bytes
-            MemorySegment desc = arena.allocate(16);
+            MemorySegment desc = arena.allocate(16, 4);
             desc.set(ValueLayout.JAVA_INT, 0, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             desc.set(ValueLayout.JAVA_INT, 4, numDescriptors);
             desc.set(ValueLayout.JAVA_INT, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
