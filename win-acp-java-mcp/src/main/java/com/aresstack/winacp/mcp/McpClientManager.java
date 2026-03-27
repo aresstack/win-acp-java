@@ -3,8 +3,10 @@ package com.aresstack.winacp.mcp;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+
 /**
- * Manages connections to multiple MCP servers and executes tool calls.
+ * Manages MCP tool execution across connected servers.
  */
 public class McpClientManager {
 
@@ -17,15 +19,21 @@ public class McpClientManager {
     }
 
     /**
-     * Execute a tool call against the appropriate MCP server.
+     * Execute a tool call, routing to the appropriate MCP server.
      */
     public ToolExecutionResult execute(ToolExecutionRequest request) {
-        log.info("Executing MCP tool: {}/{}", request.getServerId(), request.getToolName());
+        log.info("Executing tool: {}/{}", request.getServerId(), request.getToolName());
+
+        McpStdioClient client = toolRegistry.getClient(request.getServerId());
+        if (client == null) {
+            return ToolExecutionResult.failure(request.getToolName(),
+                    "No connection to MCP server: " + request.getServerId());
+        }
+
         try {
-            // TODO: route to correct MCP server and call tool via MCP SDK
-            return ToolExecutionResult.failure(request.getToolName(), "MCP tool execution not yet implemented");
-        } catch (Exception e) {
-            log.error("MCP tool execution failed: {}", request, e);
+            return client.callTool(request.getToolName(), request.getArguments());
+        } catch (IOException e) {
+            log.error("Tool execution failed: {}", request, e);
             return ToolExecutionResult.failure(request.getToolName(), e.getMessage());
         }
     }
@@ -34,4 +42,3 @@ public class McpClientManager {
         return toolRegistry;
     }
 }
-

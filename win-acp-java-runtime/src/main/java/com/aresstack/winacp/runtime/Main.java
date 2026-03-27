@@ -3,6 +3,8 @@ package com.aresstack.winacp.runtime;
 import com.aresstack.winacp.acp.AcpAgentServer;
 import com.aresstack.winacp.config.*;
 import com.aresstack.winacp.graph.AgentGraphRunner;
+import com.aresstack.winacp.inference.InferenceEngine;
+import com.aresstack.winacp.inference.StubInferenceEngine;
 import com.aresstack.winacp.mcp.McpClientManager;
 import com.aresstack.winacp.mcp.ToolRegistry;
 import org.slf4j.Logger;
@@ -27,53 +29,60 @@ public class Main {
     private static final String DEFAULT_CONFIG = "application.yml";
 
     public static void main(String[] args) {
-        log.info("win-acp-java starting");
+        log.info("win-acp-java 0.1.0-SNAPSHOT starting");
 
         try {
-            // 1. Determine config path
+            // 1. Load + validate configuration
             String configPath = resolveConfigPath(args);
-            log.info("Configuration path: {}", configPath);
+            log.info("Configuration: {}", configPath);
 
-            // 2. Load configuration (fails fast if missing)
             ConfigLoader loader = new ConfigLoader();
             RuntimeConfiguration config = loader.load(Path.of(configPath));
 
-            // 3. Validate configuration
             ConfigValidator validator = new ConfigValidator();
             List<String> errors = validator.validate(config);
             if (!errors.isEmpty()) {
-                log.error("Configuration validation failed with {} error(s) – aborting", errors.size());
+                log.error("Configuration invalid ({} error(s)) – aborting", errors.size());
                 System.exit(1);
             }
 
-            // 4. Initialize MCP tool registry
+            // 2. Initialize inference engine
+            InferenceEngine inferenceEngine = new StubInferenceEngine();
+            inferenceEngine.initialize();
+            log.info("Inference engine: {} (ready={})",
+                    inferenceEngine.getClass().getSimpleName(), inferenceEngine.isReady());
+
+            // 3. Initialize MCP tool registry
             ToolRegistry toolRegistry = new ToolRegistry();
             for (McpServerDefinition server : config.getMcpServers()) {
                 toolRegistry.discoverTools(server);
             }
             McpClientManager mcpClient = new McpClientManager(toolRegistry);
-            log.info("MCP tool registry: {} tool(s) discovered", toolRegistry.getAllTools().size());
+            log.info("MCP: {} tool(s) from {} server(s)",
+                    toolRegistry.getAllTools().size(), config.getMcpServers().size());
 
-            // 5. Build behavior graph
+            // 4. Build + wire behavior graph
             AgentGraphRunner graphRunner = new AgentGraphRunner(config.getBehavior());
-            // TODO: register node implementations based on config.getBehavior().getNodes()
+            graphRunner.registerDefaults();
+            log.info("Behavior graph: startNode='{}', {} node(s), {} edge(s)",
+                    config.getBehavior().getStartNode(),
+                    config.getBehavior().getNodes().size(),
+                    config.getBehavior().getEdges().size());
 
-            // 6. Start ACP server (blocks until shutdown)
-            AcpAgentServer server = new AcpAgentServer(graphRunner);
+            // 5. Start ACP server (blocks on stdin)
+            AcpAgentServer acpServer = new AcpAgentServer(graphRunner);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 log.info("Shutdown signal received");
-                server.shutdown();
+                acpServer.shutdown();
+                inferenceEngine.shutdown();
+                toolRegistry.closeAll();
             }));
-            server.start();
 
-            log.info("win-acp-java agent is ready – waiting for ACP requests on stdin");
+            log.info("win-acp-java ready – listening for JSON-RPC on stdin");
+            acpServer.start(); // blocks until stdin closes or shutdown
 
-            // Keep the process alive until interrupted
-            Thread.currentThread().join();
+            log.info("win-acp-java stopped");
 
-        } catch (InterruptedException e) {
-            log.info("Agent interrupted – shutting down");
-            Thread.currentThread().interrupt();
         } catch (Exception e) {
             log.error("Fatal error during startup", e);
             System.exit(2);
@@ -81,19 +90,11 @@ public class Main {
     }
 
     private static String resolveConfigPath(String[] args) {
-        // --config <path>
         for (int i = 0; i < args.length - 1; i++) {
-            if ("--config".equals(args[i])) {
-                return args[i + 1];
-            }
+            if ("--config".equals(args[i])) return args[i + 1];
         }
-
-        // Environment variable
-        String envPath = System.getenv("WIN_ACP_CONFIG");
-        if (envPath != null && !envPath.isBlank()) {
-            return envPath;
-        }
-
+        String env = System.getenv("WIN_ACP_CONFIG");
+        if (env != null && !env.isBlank()) return env;
         return DEFAULT_CONFIG;
     }
 }

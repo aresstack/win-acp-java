@@ -3,7 +3,6 @@
 dependencies {
     api project(':win-acp-java-config')
 
-    // MCP SDK – Model Context Protocol client
-    implementation 'io.modelcontextprotocol.sdk:mcp:0.15.0'
+    // JSON-RPC messaging (Jackson already provided by config module)
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.1'
 }
-
