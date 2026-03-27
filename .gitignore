@@ -5,6 +5,9 @@ out/
 
 # Gradle
 .gradle/
+!gradle/wrapper/
+!gradlew
+!gradlew.bat
 
 # IDE
 .idea/

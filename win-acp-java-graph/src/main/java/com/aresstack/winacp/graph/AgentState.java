@@ -82,4 +82,54 @@ public class AgentState {
     public ToolExecutionResult getLastToolResult() {
         return toolResults.isEmpty() ? null : toolResults.getLast();
     }
+
+    /**
+     * Serialize this state to a Map for LangGraph4j interop.
+     */
+    public Map<String, Object> toMap() {
+        Map<String, Object> map = new HashMap<>();
+        map.put(KEY_USER_INPUT, userInput);
+        map.put(KEY_GOAL, currentGoal);
+        map.put(KEY_SELECTED_TOOL, selectedTool);
+        map.put(KEY_RESPONSE, pendingResponse);
+        map.put(KEY_APPROVAL, approvalGranted);
+        map.put(KEY_ITERATION, iterationCount);
+        map.put(KEY_NEEDS_TOOL, needsTool);
+        map.put(KEY_TOOL_ALLOWED, toolAllowed);
+        map.put(KEY_NEEDS_APPROVAL, needsApproval);
+        map.put(KEY_RESULT_SUFFICIENT, resultSufficient);
+        map.put(KEY_NEEDS_CLARIFICATION, needsClarification);
+        map.put(KEY_ERROR, error);
+        map.put(KEY_TOOL_RESULTS, new ArrayList<>(toolResults));
+        return map;
+    }
+
+    /**
+     * Restore state from a LangGraph4j state map.
+     */
+    @SuppressWarnings("unchecked")
+    public static AgentState fromMap(Map<String, Object> map) {
+        AgentState state = new AgentState();
+        state.userInput = (String) map.get(KEY_USER_INPUT);
+        state.currentGoal = (String) map.get(KEY_GOAL);
+        state.selectedTool = (String) map.get(KEY_SELECTED_TOOL);
+        state.pendingResponse = (String) map.get(KEY_RESPONSE);
+        state.approvalGranted = Boolean.TRUE.equals(map.get(KEY_APPROVAL));
+        state.iterationCount = map.get(KEY_ITERATION) instanceof Number n ? n.intValue() : 0;
+        state.needsTool = Boolean.TRUE.equals(map.get(KEY_NEEDS_TOOL));
+        state.toolAllowed = map.containsKey(KEY_TOOL_ALLOWED) ? Boolean.TRUE.equals(map.get(KEY_TOOL_ALLOWED)) : true;
+        state.needsApproval = Boolean.TRUE.equals(map.get(KEY_NEEDS_APPROVAL));
+        state.resultSufficient = Boolean.TRUE.equals(map.get(KEY_RESULT_SUFFICIENT));
+        state.needsClarification = Boolean.TRUE.equals(map.get(KEY_NEEDS_CLARIFICATION));
+        state.error = (String) map.get(KEY_ERROR);
+        Object results = map.get(KEY_TOOL_RESULTS);
+        if (results instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof ToolExecutionResult r) {
+                    state.toolResults.add(r);
+                }
+            }
+        }
+        return state;
+    }
 }

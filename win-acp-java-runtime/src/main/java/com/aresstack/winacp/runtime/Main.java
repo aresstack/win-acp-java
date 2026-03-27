@@ -2,7 +2,7 @@ package com.aresstack.winacp.runtime;
 
 import com.aresstack.winacp.acp.AcpAgentServer;
 import com.aresstack.winacp.config.*;
-import com.aresstack.winacp.graph.AgentGraphRunner;
+import com.aresstack.winacp.graph.LangGraphAgentRunner;
 import com.aresstack.winacp.inference.InferenceEngine;
 import com.aresstack.winacp.inference.StubInferenceEngine;
 import com.aresstack.winacp.mcp.McpClientManager;
@@ -62,7 +62,7 @@ public class Main {
                     toolRegistry.getAllTools().size(), config.getMcpServers().size());
 
             // 4. Build + wire behavior graph
-            AgentGraphRunner graphRunner = new AgentGraphRunner(config.getBehavior());
+            LangGraphAgentRunner graphRunner = new LangGraphAgentRunner(config.getBehavior());
             graphRunner.registerDefaults();
             log.info("Behavior graph: startNode='{}', {} node(s), {} edge(s)",
                     config.getBehavior().getStartNode(),
