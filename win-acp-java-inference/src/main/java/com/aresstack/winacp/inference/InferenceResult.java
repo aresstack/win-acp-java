@@ -3,7 +3,13 @@ package com.aresstack.winacp.inference;
 /**
  * The result produced by the local inference engine.
  * <p>
- * V1 fields: generated text, finish reason, and optional token usage.
+ * <b>V1 scope:</b> For MNIST, {@code text} contains a human-readable
+ * classification result (e.g. "MNIST prediction: digit 7 (logits: …)"),
+ * not generated prose. The {@code finishReason} is always "end_turn"
+ * and {@code usage} reports pixel-count as input "tokens".
+ * <p>
+ * Future text-generation models will populate these fields with their
+ * natural semantics (generated text, token counts, stop reasons).
  */
 public class InferenceResult {
 

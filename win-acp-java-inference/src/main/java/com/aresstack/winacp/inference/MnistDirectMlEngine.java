@@ -11,29 +11,36 @@ import java.nio.file.Path;
 import java.util.Arrays;
 
 /**
- * Inference engine backed by the Windows native stack (DXGI → D3D12 → DirectML).
+ * MNIST digit-classification engine backed by DirectML on the GPU.
  * <p>
- * Loads {@code mnist-8.onnx} via the {@link MnistPipeline} which executes
- * entirely on the GPU through DirectML operator dispatches.
+ * <b>V1 scope:</b> This engine loads exactly {@code mnist-8.onnx} and
+ * classifies 28×28 grayscale images into digits 0–9. It is <em>not</em>
+ * a general-purpose ONNX inference engine, nor a text-generation /
+ * chat model. Generalized model support is a future milestone.
  * <p>
- * <b>No third-party inference runtime</b> – pure FFM → Windows DLLs.
+ * Pipeline: DXGI → D3D12 → DirectML → 5 compiled operators
+ * (Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm) → argmax.
+ * <p>
+ * <b>No ORT, no JNA, no JNI</b> – pure Java 21 FFM → Windows DLLs.
+ *
+ * @see MnistPipeline
  */
-public class DirectMlInferenceEngine implements InferenceEngine {
+public class MnistDirectMlEngine implements InferenceEngine {
 
-    private static final Logger log = LoggerFactory.getLogger(DirectMlInferenceEngine.class);
+    private static final Logger log = LoggerFactory.getLogger(MnistDirectMlEngine.class);
 
     private final InferenceConfiguration config;
     private WindowsBindings bindings;
     private MnistPipeline pipeline;
     private boolean ready = false;
 
-    public DirectMlInferenceEngine(InferenceConfiguration config) {
+    public MnistDirectMlEngine(InferenceConfiguration config) {
         this.config = config;
     }
 
     @Override
     public void initialize() throws InferenceException {
-        log.info("DirectMlInferenceEngine initializing (backend={}, model={})",
+        log.info("MnistDirectMlEngine initializing (backend={}, model={})",
                 config.getBackend(), config.getModelPath());
 
         try {
@@ -46,12 +53,12 @@ public class DirectMlInferenceEngine implements InferenceEngine {
             pipeline.loadModel(Path.of(config.getModelPath()));
 
             ready = true;
-            log.info("DirectMlInferenceEngine ready – MNIST model loaded via DirectML");
+            log.info("MnistDirectMlEngine ready – mnist-8.onnx loaded via DirectML");
 
         } catch (WindowsNativeException e) {
-            throw new InferenceException("Failed to initialize DirectML engine: " + e.getMessage(), e);
+            throw new InferenceException("Failed to initialize MNIST DirectML engine: " + e.getMessage(), e);
         } catch (Exception e) {
-            throw new InferenceException("Failed to load model: " + e.getMessage(), e);
+            throw new InferenceException("Failed to load MNIST model: " + e.getMessage(), e);
         }
     }
 
@@ -59,14 +66,14 @@ public class DirectMlInferenceEngine implements InferenceEngine {
     public InferenceResult generate(InferenceRequest request) throws InferenceException {
         if (!ready) throw new InferenceException("Engine not initialized");
 
-        log.debug("DirectMlInferenceEngine.generate: {}", request);
+        log.debug("MnistDirectMlEngine.generate: {}", request);
 
         try {
-            // For MNIST: create a test input (28x28 zeros or parse from prompt)
-            float[] input = new float[784]; // default: zeros
+            // Parse 784 pixel floats from the prompt (comma-separated),
+            // or default to all-zeros (test/demo mode).
+            float[] input = new float[784];
             String userPrompt = request.getUserPrompt();
 
-            // If the prompt contains comma-separated floats, parse them as pixel data
             if (userPrompt != null && userPrompt.contains(",")) {
                 try {
                     String[] parts = userPrompt.trim().split("[,\\s]+");
@@ -76,7 +83,7 @@ public class DirectMlInferenceEngine implements InferenceEngine {
                 } catch (NumberFormatException ignore) { /* use zeros */ }
             }
 
-            // Run inference through DirectML
+            // Run MNIST inference through DirectML
             float[] logits = pipeline.infer(input);
             int predicted = MnistPipeline.argmax(logits);
 
@@ -84,12 +91,11 @@ public class DirectMlInferenceEngine implements InferenceEngine {
                     "MNIST prediction: digit %d (logits: %s)",
                     predicted, Arrays.toString(logits));
 
-            int promptTokens = request.toFullPrompt().split("\\s+").length;
             return new InferenceResult(resultText, "end_turn",
-                    new InferenceResult.Usage(promptTokens, 1, promptTokens + 1));
+                    new InferenceResult.Usage(784, 1, 785));
 
         } catch (WindowsNativeException e) {
-            throw new InferenceException("DirectML inference failed: " + e.getMessage(), e);
+            throw new InferenceException("MNIST DirectML inference failed: " + e.getMessage(), e);
         }
     }
 
@@ -98,7 +104,7 @@ public class DirectMlInferenceEngine implements InferenceEngine {
         ready = false;
         if (pipeline != null) { pipeline.close(); pipeline = null; }
         if (bindings != null) { bindings.close(); bindings = null; }
-        log.info("DirectMlInferenceEngine shut down");
+        log.info("MnistDirectMlEngine shut down");
     }
 
     @Override
@@ -106,3 +112,4 @@ public class DirectMlInferenceEngine implements InferenceEngine {
         return ready;
     }
 }
+

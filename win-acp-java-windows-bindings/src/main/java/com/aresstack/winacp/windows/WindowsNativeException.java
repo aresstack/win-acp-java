@@ -4,8 +4,8 @@ package com.aresstack.winacp.windows;
  * Exception thrown when a Windows native call fails.
  * <p>
  * Carries the raw {@code HRESULT} so callers can decide how to react.
- * This replaces the old OnnxRuntimeBridgeException – no third-party
- * runtime types leak out of this module.
+ * {@link #getHresultDescription()} provides a human-readable name
+ * (e.g. "E_INVALIDARG (0x80070057)") when the code is known.
  */
 public class WindowsNativeException extends Exception {
 
@@ -30,5 +30,21 @@ public class WindowsNativeException extends Exception {
     public int getHresult() {
         return hresult;
     }
-}
 
+    /**
+     * Human-readable HRESULT description including symbolic name if known.
+     * Returns empty string if no HRESULT was set.
+     */
+    public String getHresultDescription() {
+        if (hresult == 0) return "";
+        return HResult.describe(hresult);
+    }
+
+    @Override
+    public String toString() {
+        if (hresult != 0) {
+            return super.toString() + " [HRESULT " + HResult.describe(hresult) + "]";
+        }
+        return super.toString();
+    }
+}

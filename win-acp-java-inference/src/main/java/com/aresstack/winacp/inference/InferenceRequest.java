@@ -5,9 +5,11 @@ import java.util.Objects;
 /**
  * A request to the local inference engine.
  * <p>
- * V1 keeps this deliberately small: model identifier, prompts, and
- * sampling parameters. No stop-sequences, no streaming, no multi-turn
- * history – those belong to later versions.
+ * <b>V1 scope:</b> For the MNIST engine, {@code userPrompt} carries either
+ * 784 comma-separated pixel floats (28×28 grayscale, 0.0–1.0) or an empty
+ * string (defaults to all-zeros / test mode). The {@code systemPrompt},
+ * {@code maxTokens}, and {@code temperature} fields are placeholders for
+ * future text-generation models and are ignored by the MNIST engine.
  */
 public class InferenceRequest {
 

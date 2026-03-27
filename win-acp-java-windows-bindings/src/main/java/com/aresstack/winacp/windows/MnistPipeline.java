@@ -62,6 +62,7 @@ public final class MnistPipeline implements AutoCloseable {
     private MemorySegment[] persistBufs;
 
     private boolean loaded = false;
+    private boolean closed = false;
 
     public MnistPipeline(WindowsBindings wb) {
         this.wb = Objects.requireNonNull(wb);
@@ -73,6 +74,7 @@ public final class MnistPipeline implements AutoCloseable {
     // ══════════════════════════════════════════════════════════════════════
 
     public void loadModel(Path onnxFile) throws WindowsNativeException, IOException {
+        if (closed) throw new IllegalStateException("MnistPipeline already closed");
         log.info("MnistPipeline.loadModel({})", onnxFile);
         OnnxModelReader.OnnxGraph graph = OnnxModelReader.parse(onnxFile);
 
@@ -334,8 +336,11 @@ public final class MnistPipeline implements AutoCloseable {
 
     /**
      * Run MNIST inference. Input: 784 floats (28×28 grayscale, 0.0–1.0). Output: 10 logits.
+     *
+     * @throws WindowsNativeException if the pipeline is not loaded, closed, or GPU dispatch fails
      */
     public float[] infer(float[] input) throws WindowsNativeException {
+        if (closed) throw new WindowsNativeException("Pipeline closed – cannot infer");
         if (!loaded) throw new WindowsNativeException("Pipeline not loaded – call loadModel() first");
         if (input.length != 784) throw new WindowsNativeException("Expected 784 floats, got " + input.length);
 
@@ -350,13 +355,15 @@ public final class MnistPipeline implements AutoCloseable {
         // Create command infrastructure for this dispatch
         log.debug("Creating command infrastructure...");
         var alloc = D3D12Bindings.createCommandAllocator(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
-        var cmdList = D3D12Bindings.createCommandList(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, arena);
-        D3D12Bindings.setDescriptorHeaps(cmdList, descriptorHeap, arena);
+        MemorySegment cmdList = null;
+        try {
+            cmdList = D3D12Bindings.createCommandList(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, arena);
+            D3D12Bindings.setDescriptorHeaps(cmdList, descriptorHeap, arena);
 
-        long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
-        long gpuBase = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap, arena);
-        log.debug("INFER: cpuBase=0x{}, gpuBase=0x{}", Long.toHexString(cpuBase), Long.toHexString(gpuBase));
-        int descOffset = 0;
+            long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+            long gpuBase = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+            log.debug("INFER: cpuBase=0x{}, gpuBase=0x{}", Long.toHexString(cpuBase), Long.toHexString(gpuBase));
+            int descOffset = 0;
 
         // ── Op 0: Conv1 + Relu ───────────────────────────────────────────
         log.debug("Dispatching Op0 (Conv1)...");
@@ -406,11 +413,14 @@ public final class MnistPipeline implements AutoCloseable {
         // Read back
         float[] result = D3D12Bindings.readbackFloats(dev, q, outputBuf, 10, arena);
 
-        DxgiBindings.release(cmdList);
-        DxgiBindings.release(alloc);
-
         log.debug("Inference complete: {}", Arrays.toString(result));
         return result;
+
+        } finally {
+            // Always release per-inference command infrastructure
+            if (cmdList != null) DxgiBindings.release(cmdList);
+            DxgiBindings.release(alloc);
+        }
     }
 
     /** Compute argmax of output logits. */
@@ -736,21 +746,33 @@ public final class MnistPipeline implements AutoCloseable {
 
     @Override
     public void close() {
+        if (closed) return;  // idempotent
+        closed = true;
         loaded = false;
-        if (cmdRecorder != null) DxgiBindings.release(cmdRecorder);
-        if (descriptorHeap != null) DxgiBindings.release(descriptorHeap);
+
+        safeRelease(cmdRecorder, "cmdRecorder");
+        safeRelease(descriptorHeap, "descriptorHeap");
         if (allCompiled != null) {
-            for (var c : allCompiled) if (c != null) DxgiBindings.release(c);
+            for (var c : allCompiled) safeRelease(c, "compiled operator");
         }
         // Release GPU buffers
         for (var buf : new MemorySegment[]{inputBuf, conv1FBuf, conv1BBuf, conv1Out, pool1Out,
                 conv2FBuf, conv2BBuf, conv2Out, pool2Out, fcWBuf, fcBBuf, outputBuf}) {
-            if (buf != null) DxgiBindings.release(buf);
+            safeRelease(buf, "GPU buffer");
         }
-        if (tempBufs != null) for (var b : tempBufs) if (b != null) DxgiBindings.release(b);
-        if (persistBufs != null) for (var b : persistBufs) if (b != null) DxgiBindings.release(b);
+        if (tempBufs != null) for (var b : tempBufs) safeRelease(b, "temp buffer");
+        if (persistBufs != null) for (var b : persistBufs) safeRelease(b, "persist buffer");
         if (arena != null) arena.close();
         log.info("MnistPipeline closed");
     }
-}
 
+    /** Null-safe COM Release (never throws). */
+    private static void safeRelease(MemorySegment comPtr, String label) {
+        if (comPtr == null || comPtr.equals(MemorySegment.NULL)) return;
+        try {
+            DxgiBindings.release(comPtr);
+        } catch (Exception e) {
+            log.warn("Failed to release {}: {}", label, e.getMessage());
+        }
+    }
+}

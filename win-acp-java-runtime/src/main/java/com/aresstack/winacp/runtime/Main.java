@@ -3,7 +3,7 @@ package com.aresstack.winacp.runtime;
 import com.aresstack.winacp.acp.AcpAgentServer;
 import com.aresstack.winacp.config.*;
 import com.aresstack.winacp.graph.LangGraphAgentRunner;
-import com.aresstack.winacp.inference.DirectMlInferenceEngine;
+import com.aresstack.winacp.inference.MnistDirectMlEngine;
 import com.aresstack.winacp.inference.InferenceEngine;
 import com.aresstack.winacp.inference.StubInferenceEngine;
 import com.aresstack.winacp.mcp.McpClientManager;
@@ -95,18 +95,18 @@ public class Main {
 
     /**
      * Select the inference engine based on configuration.
-     * <ul>
-     *   <li>If a model path is configured and the file exists → DirectMlInferenceEngine</li>
-     *   <li>Otherwise → StubInferenceEngine</li>
-     * </ul>
+     * <p>
+     * <b>V1:</b> Only {@code mnist-8.onnx} is supported. If the configured
+     * model path exists → {@link MnistDirectMlEngine}, otherwise fallback
+     * to {@link StubInferenceEngine}.
      */
     static InferenceEngine createInferenceEngine(InferenceConfiguration inferenceConfig) {
         if (inferenceConfig != null
                 && inferenceConfig.getModelPath() != null
                 && !inferenceConfig.getModelPath().isBlank()
                 && Files.exists(Path.of(inferenceConfig.getModelPath()))) {
-            log.info("Using DirectMlInferenceEngine (model={})", inferenceConfig.getModelPath());
-            return new DirectMlInferenceEngine(inferenceConfig);
+            log.info("Using MnistDirectMlEngine (model={})", inferenceConfig.getModelPath());
+            return new MnistDirectMlEngine(inferenceConfig);
         }
 
         log.info("No valid model path configured – using StubInferenceEngine");

@@ -557,6 +557,12 @@ public final class D3D12Bindings {
 
     /**
      * Execute a command list and wait for the GPU to complete (blocking poll).
+     * <p>
+     * Creates a temporary fence, signals it from the command queue, and
+     * busy-waits until the fence value reaches the signal value. The fence
+     * is released regardless of success or timeout.
+     *
+     * @throws WindowsNativeException if closing/executing fails or the fence times out
      */
     public static void executeAndWait(MemorySegment device, MemorySegment queue,
                                        MemorySegment cmdList, Arena arena)
@@ -565,72 +571,88 @@ public final class D3D12Bindings {
         executeCommandLists(queue, cmdList, arena);
 
         MemorySegment fence = createFence(device, 0, arena);
-        queueSignal(queue, fence, 1);
+        try {
+            queueSignal(queue, fence, 1);
 
-        // Busy-wait (MNIST is tiny, completes in < 1ms)
-        long timeout = System.currentTimeMillis() + 5000;
-        while (fenceGetCompletedValue(fence) < 1) {
-            if (System.currentTimeMillis() > timeout) {
-                throw new WindowsNativeException("GPU fence timeout after 5 seconds");
+            // Busy-wait with timeout (MNIST is tiny, should complete in < 100ms)
+            long timeoutMs = 10_000;
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (fenceGetCompletedValue(fence) < 1) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new WindowsNativeException(
+                            String.format("GPU fence timeout after %d ms – the GPU may be hung or " +
+                                    "the command list may contain invalid operations", timeoutMs));
+                }
+                Thread.onSpinWait();
             }
-            Thread.onSpinWait();
+        } finally {
+            DxgiBindings.release(fence);
         }
-
-        DxgiBindings.release(fence);
     }
 
     /**
      * Upload float data from CPU to a GPU default-heap buffer via an upload buffer.
+     * All intermediate resources (upload buffer, command allocator, command list)
+     * are released even if an error occurs.
      */
     public static void uploadFloats(MemorySegment device, MemorySegment queue,
                                      MemorySegment dstResource, float[] data,
                                      Arena arena) throws WindowsNativeException {
         long sizeBytes = (long) data.length * Float.BYTES;
         MemorySegment uploadBuf = createUploadBuffer(device, sizeBytes, arena);
+        MemorySegment allocator = null;
+        MemorySegment cmdList = null;
 
-        // Map → copy → unmap
-        MemorySegment mapped = mapResource(uploadBuf, arena);
-        MemorySegment.copy(data, 0, mapped, ValueLayout.JAVA_FLOAT, 0, data.length);
-        unmapResource(uploadBuf);
+        try {
+            // Map → copy → unmap
+            MemorySegment mapped = mapResource(uploadBuf, arena);
+            MemorySegment.copy(data, 0, mapped, ValueLayout.JAVA_FLOAT, 0, data.length);
+            unmapResource(uploadBuf);
 
-        // Record copy command
-        MemorySegment allocator = createCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
-        MemorySegment cmdList = createCommandList(device, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, arena);
-        copyBufferRegion(cmdList, dstResource, 0, uploadBuf, 0, sizeBytes);
-        executeAndWait(device, queue, cmdList, arena);
-
-        DxgiBindings.release(cmdList);
-        DxgiBindings.release(allocator);
-        DxgiBindings.release(uploadBuf);
+            // Record copy command
+            allocator = createCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
+            cmdList = createCommandList(device, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, arena);
+            copyBufferRegion(cmdList, dstResource, 0, uploadBuf, 0, sizeBytes);
+            executeAndWait(device, queue, cmdList, arena);
+        } finally {
+            if (cmdList != null) DxgiBindings.release(cmdList);
+            if (allocator != null) DxgiBindings.release(allocator);
+            DxgiBindings.release(uploadBuf);
+        }
     }
 
     /**
      * Read float data from a GPU default-heap buffer to CPU via a readback buffer.
+     * All intermediate resources are released even if an error occurs.
      */
     public static float[] readbackFloats(MemorySegment device, MemorySegment queue,
                                           MemorySegment srcResource, int numFloats,
                                           Arena arena) throws WindowsNativeException {
         long sizeBytes = (long) numFloats * Float.BYTES;
         MemorySegment readbackBuf = createReadbackBuffer(device, sizeBytes, arena);
+        MemorySegment allocator = null;
+        MemorySegment cmdList = null;
 
-        MemorySegment allocator = createCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
-        MemorySegment cmdList = createCommandList(device, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, arena);
+        try {
+            allocator = createCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
+            cmdList = createCommandList(device, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, arena);
 
-        transitionBarrier(cmdList, srcResource,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE, arena);
-        copyBufferRegion(cmdList, readbackBuf, 0, srcResource, 0, sizeBytes);
-        transitionBarrier(cmdList, srcResource,
-                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, arena);
-        executeAndWait(device, queue, cmdList, arena);
+            transitionBarrier(cmdList, srcResource,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE, arena);
+            copyBufferRegion(cmdList, readbackBuf, 0, srcResource, 0, sizeBytes);
+            transitionBarrier(cmdList, srcResource,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, arena);
+            executeAndWait(device, queue, cmdList, arena);
 
-        MemorySegment mapped = mapResource(readbackBuf, arena);
-        float[] result = new float[numFloats];
-        MemorySegment.copy(mapped, ValueLayout.JAVA_FLOAT, 0, result, 0, numFloats);
-        unmapResource(readbackBuf);
-
-        DxgiBindings.release(cmdList);
-        DxgiBindings.release(allocator);
-        DxgiBindings.release(readbackBuf);
-        return result;
+            MemorySegment mapped = mapResource(readbackBuf, arena);
+            float[] result = new float[numFloats];
+            MemorySegment.copy(mapped, ValueLayout.JAVA_FLOAT, 0, result, 0, numFloats);
+            unmapResource(readbackBuf);
+            return result;
+        } finally {
+            if (cmdList != null) DxgiBindings.release(cmdList);
+            if (allocator != null) DxgiBindings.release(allocator);
+            DxgiBindings.release(readbackBuf);
+        }
     }
 }

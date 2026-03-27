@@ -7,8 +7,8 @@ import org.slf4j.LoggerFactory;
  * Stub implementation of {@link InferenceEngine} for development and testing.
  * <p>
  * Returns deterministic canned responses. This is <b>not</b> a real
- * inference backend – it exists so the rest of the stack can run
- * end-to-end without a model or GPU.
+ * inference backend – it exists so the rest of the stack (ACP, graph,
+ * MCP) can run end-to-end without a GPU or the MNIST model file.
  */
 public class StubInferenceEngine implements InferenceEngine {
 
@@ -30,8 +30,9 @@ public class StubInferenceEngine implements InferenceEngine {
         log.debug("StubInferenceEngine: prompt length={} chars", request.getUserPrompt().length());
 
         // Deterministic stub response
-        String response = "[stub] I received your request but I am a stub inference engine. " +
-                "A real DirectML-based engine will replace me.";
+        String response = "[stub] MNIST inference not available – " +
+                "no GPU or model file. The real MnistDirectMlEngine classifies " +
+                "28×28 digit images via DirectML.";
 
         int wordCount = response.split("\\s+").length;
         return new InferenceResult(response, "end_turn",

@@ -104,9 +104,15 @@ public final class DefaultNodes {
     /**
      * Create an INFER node that calls the given {@link InferenceEngine}.
      * <p>
-     * This is the critical node type: it takes the current state,
-     * builds an {@link InferenceRequest}, runs real inference, and
-     * stores the result text in {@code AgentState.inferenceText}.
+     * <b>V1 scope – MNIST demo only:</b> This node feeds the user input
+     * to the inference engine and stores the result. In V1, the only real
+     * engine is {@code MnistDirectMlEngine} which classifies 28×28 digit
+     * images – it does <em>not</em> generate conversational text. The
+     * node is wired into the graph as a demonstration of the DirectML
+     * vertical slice, not as a general-purpose "chat" inference step.
+     * <p>
+     * Future text-generation models will give this node its natural
+     * chat-inference semantics.
      */
     public static AgentNode inferNode(InferenceEngine engine) {
         return state -> {

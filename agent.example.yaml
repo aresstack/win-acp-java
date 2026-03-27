@@ -4,7 +4,7 @@
 profile:
   id: default
   name: Default Agent
-  description: General-purpose ACP agent with MCP tool support
+  description: ACP agent host with MNIST DirectML inference (V1 vertical slice)
   systemRole: >
     You are a helpful assistant. Use available tools when needed.
     Always ask for approval before performing destructive actions.
@@ -66,11 +66,11 @@ approvalPolicy:
   enabled: true
   approvalRequiredByDefault: false
 
+# V1 inference: MNIST digit classification via DirectML.
+# Only mnist-8.onnx is supported. No text generation / chat models yet.
 inference:
-  modelPath: C:/Models/phi-3-mini-4k-instruct.onnx
+  modelPath: model/mnist-8.onnx
   backend: directml
-  maxTokens: 2048
-  temperature: 0.7
 
 logLevel: INFO
 debugGraphTracing: false

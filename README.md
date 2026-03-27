@@ -12,6 +12,19 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 
 ---
 
+## V1 Scope – MNIST · DirectML · Vertical Slice
+
+**V1 is a deliberate vertical slice:** one model (`mnist-8.onnx`), one
+hardware path (DirectML on the GPU), one classification task (digit 0–9).
+
+The entire stack – from Java 21 FFM calls through DXGI → D3D12 → DirectML →
+operator dispatch → argmax – is proven end-to-end with this single model.
+**No other ONNX models are supported in V1.** Generalized ONNX operator
+coverage and text-generation / chat model support are future milestones
+that will be tackled *after* the native layer is hardened and stable.
+
+---
+
 ## Architecture
 
 ```
@@ -20,10 +33,10 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 │   Main entry point · wires all layers · starts ACP server   │
 ├──────────┬──────────┬──────────┬───────────┬────────────────┤
 │   acp    │  graph   │   mcp    │ inference │ windows-bind.  │
-│ ACP JSON │ LangGr.  │ MCP std  │ DirectML  │ FFM bindings   │
-│  -RPC /  │  4j be-  │  io cli- │ inference │ for dxgi.dll   │
+│ ACP JSON │ LangGr.  │ MCP std  │ MNIST     │ FFM bindings   │
+│  -RPC /  │  4j be-  │  io cli- │ DirectML  │ for dxgi.dll   │
 │  stdio   │  havior  │  ent     │ engine    │ d3d12.dll      │
-│  server  │  engine  │          │           │ DirectML.dll   │
+│  server  │  engine  │          │ (V1)      │ DirectML.dll   │
 ├──────────┴──────────┴──────────┴───────────┴────────────────┤
 │                     win-acp-java-config                     │
 │  YAML config loading · validation · domain model            │
@@ -38,7 +51,7 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 | **acp** | ACP server: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/update` over JSON-RPC 2.0 / stdio | ✅ Implemented |
 | **graph** | LangGraph4j `StateGraph` – configurable agent behavior graph | ✅ Implemented |
 | **mcp** | MCP stdio client: `initialize`, `tools/list`, `tools/call` | ✅ Implemented (happy path) |
-| **inference** | Local inference engine backed by Windows native stack | ✅ DirectML engine (V1: MNIST end-to-end) |
+| **inference** | MNIST digit classification via DirectML (V1 vertical slice) | ✅ `MnistDirectMlEngine` working end-to-end |
 | **windows-bindings** | Hand-written FFM bindings for `dxgi.dll`, `d3d12.dll`, `DirectML.dll` – calls Windows SDK DLLs directly via Java 21 Foreign Function & Memory API | ✅ **MNIST inference via DirectML – full GPU pipeline working** |
 | **runtime** | Main entry point, wires all layers, `application` plugin | ✅ Implemented |
 
@@ -96,11 +109,10 @@ behavior:
     - { from: goal,    to: respond,  condition: TOOL_NOT_REQUIRED }
     - { from: respond, to: finalize, condition: ALWAYS }
 
-mcp:
-  servers:
-    - name: my-tools
-      command: "npx -y @my/mcp-server"
-      env: {}
+# V1: only mnist-8.onnx is supported
+inference:
+  modelPath: model/mnist-8.onnx
+  backend: directml
 ```
 
 Configuration can be passed via:
@@ -144,11 +156,12 @@ win-acp-java/
 ├── settings.gradle               # Module includes
 ├── application.yml               # Default agent configuration
 ├── agent.example.yaml            # Annotated example configuration
+├── model/mnist-8.onnx            # MNIST model (the only model V1 supports)
 ├── win-acp-java-config/          # Configuration & domain model
 ├── win-acp-java-acp/             # ACP JSON-RPC server
 ├── win-acp-java-graph/           # LangGraph4j behavior engine
 ├── win-acp-java-mcp/             # MCP stdio client
-├── win-acp-java-inference/       # Inference engine (DirectML MNIST + stub fallback)
+├── win-acp-java-inference/       # MNIST inference engine (DirectML + stub fallback)
 ├── win-acp-java-windows-bindings/# FFM bindings: DXGI, D3D12, DirectML – MNIST pipeline
 └── win-acp-java-runtime/         # Main entry point + application plugin
 ```
@@ -171,7 +184,7 @@ win-acp-java/
 | `d3d12.dll` | Direct3D 12 device, command queues, buffers, descriptor heaps, fences |
 | `DirectML.dll` | DirectML operator creation, compilation, dispatch, binding tables |
 
-## MNIST DirectML Pipeline (V1)
+## MNIST DirectML Pipeline (V1 – the only supported model)
 
 The `windows-bindings` module implements a complete GPU inference pipeline for
 [`mnist-8.onnx`](model/mnist-8.onnx) using **only** Java 21 FFM calls to Windows system DLLs:
@@ -209,17 +222,25 @@ Output: predicted digit 0–9
 - CI pipeline (GitHub Actions)
 - Gradle wrapper, multi-module build, Maven Central publishing skeleton
 
-> **V1 scope**: Only `mnist-8.onnx` is supported. This is a deliberate vertical slice to prove the pure-Java FFM → DirectML stack. Generalized ONNX support is a future milestone.
+> **V1 scope**: Only `mnist-8.onnx` is supported. This is a deliberate
+> vertical slice to prove the pure-Java FFM → DirectML stack end-to-end.
 
-### 🔜 Next (planned)
+### 🔧 Hardening (current focus)
+- [ ] COM lifecycle hardening (double-close guards, null-safe release)
+- [ ] HRESULT diagnostic messages (known error codes)
+- [ ] Fence/sync robustness (timeout, event-based wait)
+- [ ] Descriptor/buffer resource leak prevention
+- [ ] Multi-run stability tests (N-iteration, load-model-infer-close cycles)
+
+### 🔜 Next (after hardening)
 - [ ] Wire ACP `session/prompt` → LangGraph `INFER` → MNIST → argmax → answer (full vertical)
 - [ ] MCP robustness: error recovery, timeouts, reconnect
 - [ ] ACP streaming support (`session/update` with partial results)
 - [ ] jextract-generated FFM bindings to supplement hand-written ones
 - [ ] Integration tests with real MCP tool servers
 
-### 🔮 Future
-- [ ] Generalized ONNX operator support (beyond MNIST)
+### 🔮 Future (decide one at a time)
+- [ ] Next supported model type **OR** first real ONNX operator generalization – not both at once
 - [ ] GPU enumeration and selection
 - [ ] Multi-model support
 - [ ] Agent-to-agent communication

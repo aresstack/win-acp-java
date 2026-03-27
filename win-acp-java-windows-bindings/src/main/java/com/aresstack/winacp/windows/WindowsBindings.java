@@ -40,6 +40,7 @@ public final class WindowsBindings implements AutoCloseable {
     private MemorySegment dmlDevice;
 
     private boolean initialised = false;
+    private boolean closed = false;
 
     public WindowsBindings() {
         this.arena = Arena.ofConfined();
@@ -63,8 +64,11 @@ public final class WindowsBindings implements AutoCloseable {
      * </ol>
      *
      * @param backend "directml", "cpu", or "auto"
+     * @throws WindowsNativeException if initialisation fails
+     * @throws IllegalStateException  if already closed
      */
     public void init(String backend) throws WindowsNativeException {
+        if (closed) throw new IllegalStateException("WindowsBindings already closed");
         if (initialised) return;
         log.info("WindowsBindings.init(backend={})", backend);
 
@@ -123,18 +127,36 @@ public final class WindowsBindings implements AutoCloseable {
 
     @Override
     public void close() {
+        if (closed) return;           // idempotent
+        closed = true;
         if (!initialised) return;
         log.info("WindowsBindings closing – releasing COM objects");
 
-        // Release in reverse creation order
-        if (dmlDevice != null)   DxgiBindings.release(dmlDevice);
-        if (commandQueue != null) DxgiBindings.release(commandQueue);
-        if (d3d12Device != null)  DxgiBindings.release(d3d12Device);
-        if (dxgiAdapter != null)  DxgiBindings.release(dxgiAdapter);
-        if (dxgiFactory != null)  DxgiBindings.release(dxgiFactory);
+        // Release in reverse creation order; null-safe
+        safeRelease(dmlDevice,    "DML device");
+        safeRelease(commandQueue, "command queue");
+        safeRelease(d3d12Device,  "D3D12 device");
+        safeRelease(dxgiAdapter,  "DXGI adapter");
+        safeRelease(dxgiFactory,  "DXGI factory");
+
+        dmlDevice = null;
+        commandQueue = null;
+        d3d12Device = null;
+        dxgiAdapter = null;
+        dxgiFactory = null;
 
         arena.close();
         initialised = false;
         log.info("WindowsBindings closed");
+    }
+
+    /** Null-safe COM Release with error logging (never throws). */
+    private static void safeRelease(MemorySegment comPtr, String label) {
+        if (comPtr == null || comPtr.equals(MemorySegment.NULL)) return;
+        try {
+            DxgiBindings.release(comPtr);
+        } catch (Exception e) {
+            log.warn("Failed to release {} COM object: {}", label, e.getMessage());
+        }
     }
 }
