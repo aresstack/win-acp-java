@@ -22,6 +22,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - run: chmod +x gradlew
       - run: ./gradlew clean publish
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
