@@ -170,19 +170,8 @@ public final class Phi3Runtime {
      */
     private float repetitionPenalty = 1.2f;
 
-    /**
-     * Maximum number of consecutive identical tokens before generation is
-     * stopped early.  This is a safety brake for stuck loops, especially
-     * important when {@code maxTokens = 0} (unlimited).  Use 0 to disable.
-     */
-    private int maxConsecutiveRepeats = 16;
-
     public void setRepetitionPenalty(float penalty) {
         this.repetitionPenalty = Math.max(1.0f, penalty);
-    }
-
-    public void setMaxConsecutiveRepeats(int max) {
-        this.maxConsecutiveRepeats = max;
     }
 
     /**
@@ -191,12 +180,12 @@ public final class Phi3Runtime {
      * Token IDs are accumulated and decoded as a full sequence after each
      * step so that SentencePiece inter-token spaces are preserved correctly.
      * <p>
-     * Includes a <b>repetition penalty</b> (standard quality improvement for
-     * greedy decoding) and a <b>stuck-loop breaker</b> (safety net when the
-     * model enters a degenerate loop).
+     * Includes a <b>repetition penalty</b> — a standard quality improvement
+     * for greedy decoding that reduces monotonous repetitions by penalising
+     * logits of already-generated tokens.
      *
      * @param prompt    text prompt
-     * @param maxTokens maximum number of tokens to generate
+     * @param maxTokens maximum number of tokens to generate (hard ceiling)
      * @param consumer  optional callback invoked after each token (may be {@code null})
      * @return generated text (excluding the prompt)
      */
@@ -240,8 +229,6 @@ public final class Phi3Runtime {
         // ── Decode loop ──────────────────────────────────────────────
         List<Integer> generatedIds = new ArrayList<>();
         String previousText = "";
-        int consecutiveCount = 0;
-        int lastTokenId = -1;
 
         for (int step = 0; step < maxTokens; step++) {
 
@@ -254,19 +241,6 @@ public final class Phi3Runtime {
 
             if (tokenizer.isEos(nextToken)) {
                 break;
-            }
-
-            // ── Stuck-loop detection (safety brake) ─────────────────
-            if (nextToken == lastTokenId) {
-                consecutiveCount++;
-                if (maxConsecutiveRepeats > 0 && consecutiveCount >= maxConsecutiveRepeats) {
-                    log.warn("Stuck loop: token {} repeated {} times — stopping",
-                            nextToken, consecutiveCount);
-                    break;
-                }
-            } else {
-                consecutiveCount = 1;
-                lastTokenId = nextToken;
             }
 
             generatedIds.add(nextToken);
