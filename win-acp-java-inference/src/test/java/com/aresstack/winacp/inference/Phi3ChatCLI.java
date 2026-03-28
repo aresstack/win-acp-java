@@ -81,7 +81,7 @@ public class Phi3ChatCLI {
     private volatile boolean modelReady = false;
     private String mode = "unknown";
 
-    private int defaultMaxTokens = 64;
+    private int defaultMaxTokens = 512;
     private String systemPrompt =
             "You are a helpful AI assistant. Answer concisely and accurately. " +
             "Respond in the same language the user writes in.";

@@ -146,9 +146,9 @@ public class Phi3ChatUI {
         sendButton.setEnabled(false);
         sendButton.setPreferredSize(new Dimension(100, 32));
 
-        maxTokensSpinner = new JSpinner(new SpinnerNumberModel(64, 1, 2048, 16));
-        maxTokensSpinner.setToolTipText("Max Tokens");
-        maxTokensSpinner.setPreferredSize(new Dimension(70, 32));
+        maxTokensSpinner = new JSpinner(new SpinnerNumberModel(512, 1, 4096, 64));
+        maxTokensSpinner.setToolTipText("Max Tokens (Anzahl Tokens die generiert werden)");
+        maxTokensSpinner.setPreferredSize(new Dimension(80, 32));
 
         JPanel inputBar = new JPanel(new BorderLayout(4, 0));
         inputBar.setBorder(BorderFactory.createEmptyBorder(4, 8, 8, 8));
