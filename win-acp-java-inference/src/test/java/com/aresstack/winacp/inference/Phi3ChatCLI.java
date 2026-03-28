@@ -81,7 +81,7 @@ public class Phi3ChatCLI {
     private volatile boolean modelReady = false;
     private String mode = "unknown";
 
-    private int defaultMaxTokens = 512;
+    private int defaultMaxTokens = -1; // -1 = unlimited (until EOS or context limit)
     private String systemPrompt =
             "You are a helpful AI assistant. Answer concisely and accurately. " +
             "Respond in the same language the user writes in.";
@@ -156,11 +156,12 @@ public class Phi3ChatCLI {
                 return false;
             }
             case "/help" -> {
+                String maxDesc = defaultMaxTokens <= 0 ? "unlimited" : String.valueOf(defaultMaxTokens);
                 String help = """
                         Available commands:
                           /help                – show this help
                           /status              – show model status
-                          /maxTokens <n>       – set default max tokens (current: %d)
+                          /maxTokens <n|-1>    – set default max tokens (-1 = unlimited, current: %s)
                           /systemPrompt <text> – set system prompt (empty = clear)
                           /history             – show conversation history
                           /clear               – clear conversation history
@@ -168,15 +169,16 @@ public class Phi3ChatCLI {
                         
                         Chat via JSON (one line):
                           {"prompt":"Your question here"}
-                          {"prompt":"...","maxTokens":128,"systemPrompt":"..."}
-                        """.formatted(defaultMaxTokens);
+                          {"prompt":"...","maxTokens":128}
+                          {"prompt":"...","maxTokens":-1}   ← unlimited (until EOS)
+                        """.formatted(maxDesc);
                 emitCommandResult("/help", help.strip());
             }
             case "/status" -> {
                 Map<String, Object> status = new LinkedHashMap<>();
                 status.put("modelReady", modelReady);
                 status.put("mode", mode);
-                status.put("defaultMaxTokens", defaultMaxTokens);
+                status.put("defaultMaxTokens", defaultMaxTokens <= 0 ? "unlimited" : defaultMaxTokens);
                 status.put("systemPrompt", systemPrompt);
                 status.put("modelDir", MODEL_DIR.toAbsolutePath().toString());
                 if (config != null) {
@@ -184,6 +186,7 @@ public class Phi3ChatCLI {
                     cfg.put("hiddenSize", config.hiddenSize());
                     cfg.put("numHiddenLayers", config.numHiddenLayers());
                     cfg.put("vocabSize", config.vocabSize());
+                    cfg.put("maxPositionEmbeddings", config.maxPositionEmbeddings());
                     status.put("config", cfg);
                 }
                 emitJson(mapOf("type", "status", "data", status));
@@ -191,11 +194,12 @@ public class Phi3ChatCLI {
             case "/maxtokens" -> {
                 try {
                     int n = Integer.parseInt(arg);
-                    if (n < 1 || n > 4096) throw new NumberFormatException("out of range");
+                    if (n < -1 || n == 0 || n > 4096) throw new NumberFormatException("out of range");
                     defaultMaxTokens = n;
-                    emitCommandResult("/maxTokens", "maxTokens set to " + n);
+                    String desc = n == -1 ? "unlimited (until EOS)" : String.valueOf(n);
+                    emitCommandResult("/maxTokens", "maxTokens set to " + desc);
                 } catch (NumberFormatException e) {
-                    emitError("Invalid maxTokens value: '" + arg + "'. Use: /maxTokens <1-4096>");
+                    emitError("Invalid maxTokens value: '" + arg + "'. Use: /maxTokens <1-4096 or -1 for unlimited>");
                 }
             }
             case "/systemprompt" -> {
@@ -248,6 +252,12 @@ public class Phi3ChatCLI {
         }
 
         int maxTokens = intVal(request, "maxTokens", defaultMaxTokens);
+        // -1 or 0 means "unlimited" — generate until EOS (up to model context limit)
+        if (maxTokens <= 0 && config != null) {
+            maxTokens = config.maxPositionEmbeddings();
+        } else if (maxTokens <= 0) {
+            maxTokens = 4096;
+        }
         String sysPrompt = stringVal(request, "systemPrompt");
         if (sysPrompt == null) sysPrompt = systemPrompt;
 

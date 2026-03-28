@@ -85,7 +85,7 @@ public class Phi3ChatUI {
     private JButton sendButton;
     private JButton copyButton;
     private JLabel statusLabel;
-    private JSpinner maxTokensSpinner;
+    private JComboBox<String> maxTokensCombo;
 
     // ── Streaming state ──────────────────────────────────────────────────
     private JTextPane currentBotTextPane;
@@ -146,16 +146,19 @@ public class Phi3ChatUI {
         sendButton.setEnabled(false);
         sendButton.setPreferredSize(new Dimension(100, 32));
 
-        maxTokensSpinner = new JSpinner(new SpinnerNumberModel(512, 1, 4096, 64));
-        maxTokensSpinner.setToolTipText("Max Tokens (Anzahl Tokens die generiert werden)");
-        maxTokensSpinner.setPreferredSize(new Dimension(80, 32));
+        maxTokensCombo = new JComboBox<>(new String[]{
+                "\u221E bis EOS", "128", "256", "512", "1024", "2048"
+        });
+        maxTokensCombo.setSelectedIndex(0); // default: unlimited
+        maxTokensCombo.setToolTipText("Max Tokens (\u221E = Modell entscheidet, wann Schluss ist)");
+        maxTokensCombo.setPreferredSize(new Dimension(110, 32));
 
         JPanel inputBar = new JPanel(new BorderLayout(4, 0));
         inputBar.setBorder(BorderFactory.createEmptyBorder(4, 8, 8, 8));
 
         JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
         rightPanel.add(new JLabel("Max:"));
-        rightPanel.add(maxTokensSpinner);
+        rightPanel.add(maxTokensCombo);
         rightPanel.add(sendButton);
 
         copyButton = new JButton("\uD83D\uDCCB Copy");
@@ -302,7 +305,7 @@ public class Phi3ChatUI {
 
         appendUser(userText);
 
-        int maxTokens = (int) maxTokensSpinner.getValue();
+        int maxTokens = getSelectedMaxTokens();
         statusLabel.setText("  Generiere\u2026");
 
         new Thread(() -> {
@@ -554,6 +557,23 @@ public class Phi3ChatUI {
     // ══════════════════════════════════════════════════════════════════════
     // Utility
     // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Read the selected max tokens from the combo box.
+     * First entry ("∞ bis EOS") means unlimited — use model context limit.
+     */
+    private int getSelectedMaxTokens() {
+        String selected = (String) maxTokensCombo.getSelectedItem();
+        if (selected == null || selected.startsWith("\u221E")) {
+            // Unlimited: use model's context window as hard ceiling
+            return config != null ? config.maxPositionEmbeddings() : 4096;
+        }
+        try {
+            return Integer.parseInt(selected.trim());
+        } catch (NumberFormatException e) {
+            return 4096;
+        }
+    }
 
     private String escapeHtml(String input) {
         if (input == null) return "";
