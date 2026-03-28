@@ -12,10 +12,39 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 
 ---
 
-## V1 Scope – Small 28×28 Grayscale CNN · DirectML · Vertical Slice
+## Current Target – Phi-3-mini LLM Driver · DirectML · Java 21 FFM
 
-**V1 scope:** small 28×28 grayscale CNN vertical slice, validated with
-`mnist-12.onnx`, `mnist-12-int8.onnx`, and `mnist_emnist_blank_cnn_v1.onnx`.
+**Goal:** A pure Java 21 LLM inference driver for
+[Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-onnx)
+(DirectML INT4 AWQ variant) on Windows, using only FFM + Windows system DLLs.
+No ONNX Runtime, no ORT GenAI, no JNA/JNI, no third-party DLLs.
+
+| Component | Detail |
+|---|---|
+| Model | `microsoft/Phi-3-mini-4k-instruct-onnx` · `directml-int4-awq-block-128` |
+| Architecture | Phi3ForCausalLM · 32 layers · hidden=3072 · 32 heads · head_dim=96 |
+| Quantization | INT4 AWQ block-128 (uint8 packed, float16 scales+zp) |
+| Tokenizer | BPE (LlamaTokenizer) · vocab=32064 |
+| Context | 4096 tokens |
+| Inference | Prefill + autoregressive decode with KV-cache |
+
+### Definition of Done (next milestone)
+
+- [ ] ONNX weights parsed (INT4 MatMulNBits format)
+- [ ] BPE tokenizer runs in Java
+- [ ] Token embedding + RMSNorm + RoPE
+- [ ] Self-attention with KV-cache
+- [ ] SiLU MLP (gate-up-down)
+- [ ] Greedy decode loop produces tokens
+- [ ] At least 1 correct token from a simple prompt
+- [ ] No ORT, no third-party DLLs
+
+---
+
+## Technology Demonstrator – CNN Vertical Slice (completed)
+
+The CNN pipeline below is a **technology demonstrator** that proved the
+DXGI → D3D12 → DirectML → FFM stack works end-to-end. It is not the product target.
 
 | Model | Architecture | Output | Status |
 |---|---|---|---|
@@ -24,22 +53,8 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 | `mnist-8.onnx` | Same (opset 8, float32) | 10 logits (digits 0–9) | ✅ |
 | `mnist_emnist_blank_cnn_v1.onnx` | 3×Conv+ReLU, 2×MaxPool, Gemm+ReLU (BN folded), Gemm | 11 logits (digits 0–9 + blank) | ✅ |
 
-The EMNIST+blank model proves the pipeline handles a **second architecture**
-with different layer topology (3 convolutions, batch normalization in the
-classifier head, 11-class output). BatchNorm is **supported via inference-mode
-fusion** (folded into FC weights at load time), not as a separate general-purpose
-runtime operator. Dropout layers are absent in the ONNX graph (eliminated
-during PyTorch eval-mode export).
-
-The int8 model is supported via **dequantize-first**: quantized INT8 weights
-are dequantized to float32 at load time, then processed through the same
-DirectML operator pipeline.
-
-The entire stack – from Java 21 FFM calls through DXGI → D3D12 → DirectML →
-operator dispatch → argmax – is proven end-to-end with this model family.
-**No other ONNX model architectures are supported in V1.** Generalized ONNX
-operator coverage and text-generation / chat model support are future
-milestones that will be tackled *after* the native layer is hardened and stable.
+BatchNorm is supported via **inference-mode fusion** (folded into FC weights
+at load time). The int8 model uses **dequantize-first** at load time.
 
 ---
 
