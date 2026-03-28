@@ -7,11 +7,13 @@ package com.aresstack.winacp.inference;
  * The concrete implementation is hidden behind it – no ACP, graph, or
  * MCP code may know about Windows/DirectML details.
  * <p>
- * <b>V1 scope:</b> The only real implementation is
- * {@link MnistDirectMlEngine} which classifies 28×28 grayscale digits
- * via DirectML on the GPU. Text generation or chat models are <em>not</em>
- * supported in V1. A {@link StubInferenceEngine} exists for development
- * and testing without a GPU.
+ * <b>Implementations:</b>
+ * <ul>
+ *   <li>{@link Phi3InferenceEngine} — Phi-3-mini-4k-instruct text generation
+ *       (CPU-first decode, INT4 AWQ weights, greedy sampling)</li>
+ *   <li>{@link MnistDirectMlEngine} — 28×28 digit classification via DirectML</li>
+ *   <li>{@link StubInferenceEngine} — Deterministic stub for testing without GPU</li>
+ * </ul>
  */
 public interface InferenceEngine {
 

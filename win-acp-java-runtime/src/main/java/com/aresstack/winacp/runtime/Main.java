@@ -4,6 +4,7 @@ import com.aresstack.winacp.acp.AcpAgentServer;
 import com.aresstack.winacp.config.*;
 import com.aresstack.winacp.graph.LangGraphAgentRunner;
 import com.aresstack.winacp.inference.MnistDirectMlEngine;
+import com.aresstack.winacp.inference.Phi3InferenceEngine;
 import com.aresstack.winacp.inference.InferenceEngine;
 import com.aresstack.winacp.inference.StubInferenceEngine;
 import com.aresstack.winacp.mcp.McpClientManager;
@@ -100,21 +101,39 @@ public class Main {
     /**
      * Select the inference engine based on configuration.
      * <p>
-     * <b>V1:</b> MNIST-family CNN models (currently validated with
-     * {@code mnist-12.onnx}). If the configured model path exists →
-     * {@link MnistDirectMlEngine}, otherwise fallback to
-     * {@link StubInferenceEngine}.
+     * Detection order:
+     * <ol>
+     *   <li><b>Phi-3</b>: If modelPath is a directory containing
+     *       {@code config.json}, {@code tokenizer.json}, {@code model.onnx},
+     *       and {@code model.onnx.data} → {@link Phi3InferenceEngine}</li>
+     *   <li><b>MNIST</b>: If modelPath is an existing {@code .onnx} file →
+     *       {@link MnistDirectMlEngine}</li>
+     *   <li><b>Stub</b>: Fallback → {@link StubInferenceEngine}</li>
+     * </ol>
      */
     static InferenceEngine createInferenceEngine(InferenceConfiguration inferenceConfig) {
-        if (inferenceConfig != null
-                && inferenceConfig.getModelPath() != null
-                && !inferenceConfig.getModelPath().isBlank()
-                && Files.exists(Path.of(inferenceConfig.getModelPath()))) {
-            log.info("Using MnistDirectMlEngine (model={})", inferenceConfig.getModelPath());
+        if (inferenceConfig == null
+                || inferenceConfig.getModelPath() == null
+                || inferenceConfig.getModelPath().isBlank()) {
+            log.info("No model path configured – using StubInferenceEngine");
+            return new StubInferenceEngine();
+        }
+
+        Path modelPath = Path.of(inferenceConfig.getModelPath());
+
+        // 1. Phi-3 model directory?
+        if (Phi3InferenceEngine.isValidModelDir(modelPath)) {
+            log.info("Detected Phi-3 model directory: {}", modelPath);
+            return new Phi3InferenceEngine(inferenceConfig);
+        }
+
+        // 2. MNIST .onnx file?
+        if (Files.exists(modelPath) && modelPath.toString().endsWith(".onnx")) {
+            log.info("Using MnistDirectMlEngine (model={})", modelPath);
             return new MnistDirectMlEngine(inferenceConfig);
         }
 
-        log.info("No valid model path configured – using StubInferenceEngine");
+        log.info("Model path '{}' not recognized – using StubInferenceEngine", modelPath);
         return new StubInferenceEngine();
     }
 
