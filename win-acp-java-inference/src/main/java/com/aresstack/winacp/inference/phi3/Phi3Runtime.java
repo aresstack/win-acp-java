@@ -5,7 +5,9 @@ import com.aresstack.winacp.windows.MatMulNBitsKernel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * Decoder runtime for Phi-3-mini-4k-instruct.
@@ -72,16 +74,48 @@ public final class Phi3Runtime {
         }
     }
 
+    // ── Streaming callback ────────────────────────────────────────────────
+
+    /**
+     * Callback for token-by-token streaming during generation.
+     */
+    @FunctionalInterface
+    public interface TokenConsumer {
+        /**
+         * Called after each generated token.
+         *
+         * @param tokenId   the token ID just generated
+         * @param textSoFar full decoded text of all tokens generated so far
+         * @param delta     new text fragment appended in this step
+         */
+        void onToken(int tokenId, String textSoFar, String delta);
+    }
+
     // ── Public API ───────────────────────────────────────────────────────
 
     /**
-     * Generate tokens greedily from a prompt.
+     * Generate tokens greedily from a prompt (non-streaming).
      *
-     * @param prompt    text prompt (will be formatted with chat template if system/user provided)
+     * @param prompt    text prompt
      * @param maxTokens maximum number of tokens to generate
      * @return generated text (excluding the prompt)
      */
     public String generate(String prompt, int maxTokens) {
+        return generateStreaming(prompt, maxTokens, null);
+    }
+
+    /**
+     * Generate tokens greedily with a per-token streaming callback.
+     * <p>
+     * Token IDs are accumulated and decoded as a full sequence after each
+     * step so that SentencePiece inter-token spaces are preserved correctly.
+     *
+     * @param prompt    text prompt
+     * @param maxTokens maximum number of tokens to generate
+     * @param consumer  optional callback invoked after each token (may be {@code null})
+     * @return generated text (excluding the prompt)
+     */
+    public String generateStreaming(String prompt, int maxTokens, TokenConsumer consumer) {
         log.info("Encoding prompt ({} chars)", prompt.length());
         int[] inputIds = tokenizer.encode(prompt);
         log.info("Prompt tokens: {}", inputIds.length);
@@ -93,8 +127,10 @@ public final class Phi3Runtime {
         log.info("Prefill: {} tokens", inputIds.length);
         float[] logits = prefill(inputIds);
 
-        // Decode loop
-        StringBuilder result = new StringBuilder();
+        // Accumulate generated token IDs for proper decoding (preserves spaces)
+        List<Integer> generatedIds = new ArrayList<>();
+        String previousText = "";
+
         for (int step = 0; step < maxTokens; step++) {
             int nextToken = argmax(logits);
 
@@ -103,18 +139,27 @@ public final class Phi3Runtime {
                 break;
             }
 
-            String tokenStr = tokenizer.decode(new int[]{nextToken});
-            result.append(tokenStr);
+            generatedIds.add(nextToken);
+
+            // Decode full sequence to preserve SentencePiece spaces
+            String fullText = tokenizer.decode(
+                    generatedIds.stream().mapToInt(Integer::intValue).toArray());
+            String delta = fullText.substring(previousText.length());
+            previousText = fullText;
+
+            if (consumer != null) {
+                consumer.onToken(nextToken, fullText, delta);
+            }
 
             if (step < 10 || step % 50 == 0) {
-                log.debug("Step {}: token={} '{}'", step, nextToken, tokenStr.trim());
+                log.debug("Step {}: token={} '{}'", step, nextToken, delta.trim());
             }
 
             // Decode: process single token
             logits = decode(nextToken);
         }
 
-        return result.toString();
+        return previousText;
     }
 
     /**

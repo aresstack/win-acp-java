@@ -1,9 +1,11 @@
 package com.aresstack.winacp.inference;
 
 import com.aresstack.winacp.inference.phi3.Phi3Config;
+import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
 import com.aresstack.winacp.inference.phi3.Phi3Weights;
+import com.aresstack.winacp.windows.WindowsBindings;
 
 import javax.swing.*;
 import javax.swing.text.*;
@@ -55,6 +57,8 @@ public class Phi3ChatUI {
     private Phi3Tokenizer tokenizer;
     private Phi3Weights weights;
     private Phi3Runtime runtime;
+    private WindowsBindings wb;
+    private Phi3GpuKernels gpuKernels;
     private volatile boolean modelReady = false;
     private volatile boolean generating = false;
 
@@ -149,6 +153,15 @@ public class Phi3ChatUI {
 
         frame.setVisible(true);
 
+        // ── Cleanup GPU on close ──────────────────────────────────────
+        frame.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                if (gpuKernels != null) try { gpuKernels.close(); } catch (Exception ignored) {}
+                if (wb != null) try { wb.close(); } catch (Exception ignored) {}
+            }
+        });
+
         // ── Load model in background ─────────────────────────────────
         appendSystem("Lade Phi-3 Modell von:\n" + MODEL_DIR.toAbsolutePath());
         new Thread(this::loadModel, "model-loader").start();
@@ -174,21 +187,48 @@ public class Phi3ChatUI {
             config = Phi3Config.load(MODEL_DIR.resolve("config.json"));
             tokenizer = Phi3Tokenizer.load(MODEL_DIR.resolve("tokenizer.json"));
             weights = Phi3Weights.load(MODEL_DIR, config);
-            runtime = new Phi3Runtime(config, weights, tokenizer);
+
+            // ── Try GPU acceleration ──────────────────────────────────
+            String mode = "CPU";
+            try {
+                if (WindowsBindings.isSupported()) {
+                    wb = new WindowsBindings();
+                    wb.init("directml");
+                    if (wb.hasDirectMl()) {
+                        int gpuLayers = Integer.getInteger("phi3.gpu.layers",
+                                config.numHiddenLayers());
+                        boolean gpuLmHead = Boolean.parseBoolean(
+                                System.getProperty("phi3.gpu.lmhead", "true"));
+                        gpuKernels = Phi3GpuKernels.create(
+                                wb, weights, config, gpuLayers, gpuLmHead);
+                        mode = "GPU (" + gpuKernels.getGpuLayers() + "/"
+                                + config.numHiddenLayers() + " layers)";
+                    }
+                }
+            } catch (Exception gpuEx) {
+                System.err.println("GPU init failed, falling back to CPU: " + gpuEx.getMessage());
+                gpuEx.printStackTrace();
+                // Clean up partial GPU init
+                if (gpuKernels != null) { try { gpuKernels.close(); } catch (Exception ignored) {} gpuKernels = null; }
+                if (wb != null) { try { wb.close(); } catch (Exception ignored) {} wb = null; }
+            }
+
+            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
 
             long elapsed = System.currentTimeMillis() - t0;
             modelReady = true;
 
+            final String modeLabel = mode;
             SwingUtilities.invokeLater(() -> {
                 appendSystem(String.format("✅ Modell geladen in %.1f s  (hidden=%d, layers=%d, vocab=%d)",
                         elapsed / 1000.0, config.hiddenSize(),
                         config.numHiddenLayers(), config.vocabSize()));
-                appendSystem("CPU-Modus aktiv. Tippe eine Nachricht und drücke Enter.");
+                appendSystem(modeLabel + "-Modus aktiv. Tippe eine Nachricht und drücke Enter.");
                 appendSystem("─".repeat(60));
                 inputField.setEnabled(true);
                 sendButton.setEnabled(true);
                 inputField.requestFocusInWindow();
-                statusLabel.setText("  Bereit – CPU-Modus");
+                statusLabel.setText("  Bereit – " + modeLabel);
             });
 
         } catch (Exception e) {
@@ -225,17 +265,32 @@ public class Phi3ChatUI {
                 String prompt = tokenizer.formatChat(null, userText);
                 runtime.resetCache();
 
-                long t0 = System.currentTimeMillis();
-                String response = runtime.generate(prompt, maxTokens);
-                long elapsed = System.currentTimeMillis() - t0;
+                // Insert bot response header
+                SwingUtilities.invokeLater(() ->
+                        append(timestamp() + " Phi-3:\n", styleTime));
 
-                int tokens = tokenizer.encode(response).length;
+                long t0 = System.currentTimeMillis();
+                final int[] tokenCount = {0};
+
+                // Stream tokens directly into the chat pane
+                String response = runtime.generateStreaming(prompt, maxTokens,
+                        (tokenId, textSoFar, delta) -> {
+                            tokenCount[0]++;
+                            SwingUtilities.invokeLater(() -> {
+                                try {
+                                    chatDoc.insertString(chatDoc.getLength(), delta, styleBot);
+                                    chatPane.setCaretPosition(chatDoc.getLength());
+                                } catch (BadLocationException ignored) {}
+                            });
+                        });
+
+                long elapsed = System.currentTimeMillis() - t0;
                 String stats = String.format("[%d tokens, %.1f s, %.1f ms/token]",
-                        tokens, elapsed / 1000.0,
-                        tokens > 0 ? (double) elapsed / tokens : 0);
+                        tokenCount[0], elapsed / 1000.0,
+                        tokenCount[0] > 0 ? (double) elapsed / tokenCount[0] : 0);
 
                 SwingUtilities.invokeLater(() -> {
-                    appendBot(response.strip());
+                    append("\n\n", styleBot);
                     appendSystem(stats);
                     statusLabel.setText("  Bereit – " + stats);
                     inputField.setEnabled(true);
