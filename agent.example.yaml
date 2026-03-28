@@ -69,11 +69,14 @@ approvalPolicy:
   enabled: true
   approvalRequiredByDefault: false
 
-# V1 inference: MNIST digit classification via DirectML.
-# Currently validated with mnist-12.onnx. No text generation / chat models yet.
+# V1 inference: Phi-3-mini-4k-instruct text generation via DirectML.
+# INT4 AWQ quantized weights, greedy decode, batch_size=1.
+# For CPU-only mode, set backend: cpu
+# For GPU layers control: java -Dphi3.gpu.layers=16 (default: all)
 inference:
-  modelPath: model/mnist-12.onnx
+  modelPath: model/phi3-mini-directml-int4/directml/directml-int4-awq-block-128
   backend: directml
+  maxTokens: 256
 
 logLevel: INFO
 debugGraphTracing: false

@@ -1,14 +1,14 @@
 package com.aresstack.winacp.inference.phi3;
 
 import com.aresstack.winacp.inference.phi3.Phi3Weights.LayerWeights;
-import com.aresstack.winacp.inference.phi3.Phi3Weights.QuantizedWeight;
+import com.aresstack.winacp.windows.MatMulNBitsKernel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Arrays;
 
 /**
- * CPU-first decoder runtime for Phi-3-mini-4k-instruct.
+ * Decoder runtime for Phi-3-mini-4k-instruct.
  *
  * <p>Implements the full Phi-3 decoder stack:
  * <ol>
@@ -18,9 +18,15 @@ import java.util.Arrays;
  *   <li>Final RMSNorm + LM head logits</li>
  * </ol>
  *
- * <p>V1 constraints:
+ * <p>V1 supports two execution modes:
  * <ul>
- *   <li>All computation on CPU (correctness first, GPU later)</li>
+ *   <li><b>CPU-only</b>: all matrix multiplications on CPU (default)</li>
+ *   <li><b>GPU-accelerated</b>: quantized projections dispatched to DirectML
+ *       via {@link Phi3GpuKernels}; attention, norms, and activations remain on CPU</li>
+ * </ul>
+ *
+ * <p>Constraints:
+ * <ul>
  *   <li>Greedy decoding only (no sampling)</li>
  *   <li>Single-batch (batch_size=1)</li>
  * </ul>
@@ -32,18 +38,38 @@ public final class Phi3Runtime {
     private final Phi3Config config;
     private final Phi3Weights weights;
     private final Phi3Tokenizer tokenizer;
+    private final Phi3GpuKernels gpuKernels; // nullable — null means CPU-only
 
     // KV cache: [layer][2 (k/v)][head][position][headDim]
-    // Stored flat as: [numLayers][2][maxPos * numHeads * headDim]
+    // Stored flat as: [numLayers][2][allocated]
     private final float[][] kvCache; // [numLayers * 2][allocated]
     private int cachedSeqLen;        // number of positions in cache
 
+    /**
+     * CPU-only constructor (backward compatible).
+     */
     public Phi3Runtime(Phi3Config config, Phi3Weights weights, Phi3Tokenizer tokenizer) {
+        this(config, weights, tokenizer, null);
+    }
+
+    /**
+     * @param gpuKernels optional GPU kernel pool — {@code null} for CPU-only mode
+     */
+    public Phi3Runtime(Phi3Config config, Phi3Weights weights, Phi3Tokenizer tokenizer,
+                       Phi3GpuKernels gpuKernels) {
         this.config = config;
         this.weights = weights;
         this.tokenizer = tokenizer;
+        this.gpuKernels = gpuKernels;
         this.kvCache = new float[config.numHiddenLayers() * 2][];
         this.cachedSeqLen = 0;
+
+        if (gpuKernels != null) {
+            log.info("Phi3Runtime: GPU mode — {}/{} layers on GPU, lmHead={}",
+                    gpuKernels.getGpuLayers(), config.numHiddenLayers(), gpuKernels.hasLmHead());
+        } else {
+            log.info("Phi3Runtime: CPU-only mode");
+        }
     }
 
     // ── Public API ───────────────────────────────────────────────────────
@@ -127,7 +153,7 @@ public final class Phi3Runtime {
         rmsNorm(lastHidden, weights.finalNormWeight, config.rmsNormEps());
 
         float[] logits = new float[weights.lmHead.N()];
-        weights.lmHead.matvec(lastHidden, logits);
+        lmHeadMatvec(lastHidden, logits);
 
         cachedSeqLen = seqLen;
         return logits;
@@ -159,10 +185,24 @@ public final class Phi3Runtime {
         rmsNorm(hidden_states, weights.finalNormWeight, config.rmsNormEps());
 
         float[] logits = new float[weights.lmHead.N()];
-        weights.lmHead.matvec(hidden_states, logits);
+        lmHeadMatvec(hidden_states, logits);
 
         cachedSeqLen = pos + 1;
         return logits;
+    }
+
+    // ── LM head: GPU or CPU ──────────────────────────────────────────────
+
+    /**
+     * Compute logits = x @ lm_head^T, using GPU if available.
+     */
+    private void lmHeadMatvec(float[] x, float[] logits) {
+        if (gpuKernels != null && gpuKernels.hasLmHead()) {
+            float[] result = gpuKernels.lmHead().matvec(x);
+            System.arraycopy(result, 0, logits, 0, result.length);
+        } else {
+            weights.lmHead.matvec(x, logits);
+        }
     }
 
     // ── Layer processing ─────────────────────────────────────────────────
@@ -182,6 +222,7 @@ public final class Phi3Runtime {
         int headDim = config.headDim();
         int kvHeads = config.numKeyValueHeads();
         LayerWeights lw = weights.layers[layerIdx];
+        boolean gpuLayer = gpuKernels != null && gpuKernels.hasLayer(layerIdx);
 
         // ── Pre-attention RMSNorm ────────────────────────────────────
         float[] normed = new float[seqLen * hidden];
@@ -192,14 +233,20 @@ public final class Phi3Runtime {
             System.arraycopy(row, 0, normed, s * hidden, hidden);
         }
 
-        // ── Q/K/V Projections ────────────────────────────────────────
+        // ── Q/K/V Projections (GPU or CPU) ────────────────────────────
         float[] q = new float[seqLen * hidden]; // [seqLen, numHeads * headDim]
         float[] k = new float[seqLen * hidden]; // [seqLen, kvHeads * headDim]
         float[] v = new float[seqLen * hidden]; // [seqLen, kvHeads * headDim]
 
-        lw.qProj().matmul(normed, q, seqLen);
-        lw.kProj().matmul(normed, k, seqLen);
-        lw.vProj().matmul(normed, v, seqLen);
+        if (gpuLayer) {
+            gpuMatmul(gpuKernels.qProj(layerIdx), normed, q, seqLen, hidden, hidden);
+            gpuMatmul(gpuKernels.kProj(layerIdx), normed, k, seqLen, hidden, hidden);
+            gpuMatmul(gpuKernels.vProj(layerIdx), normed, v, seqLen, hidden, hidden);
+        } else {
+            lw.qProj().matmul(normed, q, seqLen);
+            lw.kProj().matmul(normed, k, seqLen);
+            lw.vProj().matmul(normed, v, seqLen);
+        }
 
         // ── RoPE ─────────────────────────────────────────────────────
         for (int s = 0; s < seqLen; s++) {
@@ -286,7 +333,6 @@ public final class Phi3Runtime {
         }
 
         // ── Activation scale + O projection ──────────────────────────
-        // Apply weight-only quantization input scale
         for (int s = 0; s < seqLen; s++) {
             for (int i = 0; i < hidden; i++) {
                 attnOut[s * hidden + i] *= lw.attnOutScale()[i];
@@ -294,7 +340,11 @@ public final class Phi3Runtime {
         }
 
         float[] oProjOut = new float[seqLen * hidden];
-        lw.oProj().matmul(attnOut, oProjOut, seqLen);
+        if (gpuLayer) {
+            gpuMatmul(gpuKernels.oProj(layerIdx), attnOut, oProjOut, seqLen, hidden, hidden);
+        } else {
+            lw.oProj().matmul(attnOut, oProjOut, seqLen);
+        }
 
         // ── Residual connection 1 ────────────────────────────────────
         float[] residual1 = new float[seqLen * hidden];
@@ -311,15 +361,17 @@ public final class Phi3Runtime {
             System.arraycopy(row, 0, postNormed, s * hidden, hidden);
         }
 
-        // ── MLP: gate_up_proj ────────────────────────────────────────
+        // ── MLP: gate_up_proj (GPU or CPU) ────────────────────────────
         int intermediateX2 = config.intermediateSize() * 2;
         float[] gateUp = new float[seqLen * intermediateX2];
-        lw.gateUpProj().matmul(postNormed, gateUp, seqLen);
+        if (gpuLayer) {
+            gpuMatmul(gpuKernels.gateUpProj(layerIdx), postNormed, gateUp,
+                    seqLen, hidden, intermediateX2);
+        } else {
+            lw.gateUpProj().matmul(postNormed, gateUp, seqLen);
+        }
 
         // ── SwiGLU activation ────────────────────────────────────────
-        // gate_up_proj output is [seqLen, 2*intermediate]
-        // Split into gate[intermediate] and up[intermediate]
-        // SwiGLU: output = up * SiLU(gate) = up * gate * sigmoid(gate)
         int intermediate = config.intermediateSize();
         float[] mlpActivation = new float[seqLen * intermediate];
         for (int s = 0; s < seqLen; s++) {
@@ -328,13 +380,12 @@ public final class Phi3Runtime {
             for (int i = 0; i < intermediate; i++) {
                 float gate = gateUp[guOff + i];
                 float up = gateUp[guOff + intermediate + i];
-                // SiLU(gate) = gate * sigmoid(gate)
                 float sigmoid = 1.0f / (1.0f + (float) Math.exp(-gate));
                 mlpActivation[outOff + i] = up * gate * sigmoid;
             }
         }
 
-        // ── Activation scale + down_proj ─────────────────────────────
+        // ── Activation scale + down_proj (GPU or CPU) ─────────────────
         for (int s = 0; s < seqLen; s++) {
             for (int i = 0; i < intermediate; i++) {
                 mlpActivation[s * intermediate + i] *= lw.mlpOutScale()[i];
@@ -342,7 +393,12 @@ public final class Phi3Runtime {
         }
 
         float[] downOut = new float[seqLen * hidden];
-        lw.downProj().matmul(mlpActivation, downOut, seqLen);
+        if (gpuLayer) {
+            gpuMatmul(gpuKernels.downProj(layerIdx), mlpActivation, downOut,
+                    seqLen, intermediate, hidden);
+        } else {
+            lw.downProj().matmul(mlpActivation, downOut, seqLen);
+        }
 
         // ── Residual connection 2 ────────────────────────────────────
         float[] output = new float[seqLen * hidden];
@@ -351,6 +407,23 @@ public final class Phi3Runtime {
         }
 
         return output;
+    }
+
+    // ── GPU matmul helper ─────────────────────────────────────────────────
+
+    /**
+     * GPU-accelerated matrix multiplication: Y[seqLen, N] = X[seqLen, K] @ W^T.
+     * Calls {@link MatMulNBitsKernel#matvec(float[])} once per row.
+     */
+    private static void gpuMatmul(MatMulNBitsKernel kernel,
+                                   float[] input, float[] output,
+                                   int seqLen, int K, int N) {
+        for (int s = 0; s < seqLen; s++) {
+            float[] row = new float[K];
+            System.arraycopy(input, s * K, row, 0, K);
+            float[] result = kernel.matvec(row);
+            System.arraycopy(result, 0, output, s * N, N);
+        }
     }
 
     // ── Math utilities ───────────────────────────────────────────────────

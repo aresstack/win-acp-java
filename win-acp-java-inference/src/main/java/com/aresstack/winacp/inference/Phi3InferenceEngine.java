@@ -2,9 +2,11 @@ package com.aresstack.winacp.inference;
 
 import com.aresstack.winacp.config.InferenceConfiguration;
 import com.aresstack.winacp.inference.phi3.Phi3Config;
+import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
 import com.aresstack.winacp.inference.phi3.Phi3Weights;
+import com.aresstack.winacp.windows.WindowsBindings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,7 +18,15 @@ import java.nio.file.Path;
  * {@link InferenceEngine} implementation for Phi-3-mini-4k-instruct.
  * <p>
  * Loads the Phi-3 model from the DirectML INT4 AWQ variant and runs
- * text generation using the CPU-first decoder runtime ({@link Phi3Runtime}).
+ * text generation using the decoder runtime ({@link Phi3Runtime}).
+ * <p>
+ * <b>Execution modes:</b>
+ * <ul>
+ *   <li><b>CPU</b> ({@code backend="cpu"}): all matrix multiplications on CPU</li>
+ *   <li><b>DirectML</b> ({@code backend="directml"}): projections dispatched to GPU
+ *       via {@link Phi3GpuKernels}; attention/norms/activations on CPU</li>
+ *   <li><b>Auto</b> ({@code backend="auto"}): try DirectML, fall back to CPU</li>
+ * </ul>
  * <p>
  * <b>Model requirements:</b>
  * <ul>
@@ -26,11 +36,12 @@ import java.nio.file.Path;
  *   <li>{@code model.onnx.data} — External weight data (~2.1 GB)</li>
  * </ul>
  * <p>
- * <b>V1 constraints:</b>
+ * <b>System properties:</b>
  * <ul>
- *   <li>CPU-only decode (correctness first, GPU kernel proven separately)</li>
- *   <li>Greedy decoding, no sampling</li>
- *   <li>Batch size 1</li>
+ *   <li>{@code phi3.gpu.layers} — number of decoder layers to place on GPU
+ *       (default: all layers)</li>
+ *   <li>{@code phi3.gpu.lmhead} — put lm_head projection on GPU
+ *       (default: {@code true})</li>
  * </ul>
  */
 public class Phi3InferenceEngine implements InferenceEngine {
@@ -39,27 +50,49 @@ public class Phi3InferenceEngine implements InferenceEngine {
 
     private final Path modelDir;
     private final int defaultMaxTokens;
+    private final String backend;   // "directml" | "cpu" | "auto"
 
     private Phi3Config config;
     private Phi3Tokenizer tokenizer;
     private Phi3Weights weights;
     private Phi3Runtime runtime;
+
+    // GPU resources (created during initialize if backend != "cpu")
+    private WindowsBindings wb;
+    private Phi3GpuKernels gpuKernels;
+
     private boolean ready = false;
 
     /**
+     * CPU-only convenience constructor.
+     *
      * @param modelDir path to the directory containing model files
      */
     public Phi3InferenceEngine(Path modelDir) {
-        this(modelDir, 256);
+        this(modelDir, 256, "cpu");
     }
 
     /**
+     * CPU-only convenience constructor with custom max tokens.
+     *
      * @param modelDir         path to the directory containing model files
      * @param defaultMaxTokens default maximum tokens to generate if not specified in request
      */
     public Phi3InferenceEngine(Path modelDir, int defaultMaxTokens) {
+        this(modelDir, defaultMaxTokens, "cpu");
+    }
+
+    /**
+     * Full constructor with backend selection.
+     *
+     * @param modelDir         path to the directory containing model files
+     * @param defaultMaxTokens default maximum tokens to generate if not specified in request
+     * @param backend          "directml", "cpu", or "auto"
+     */
+    public Phi3InferenceEngine(Path modelDir, int defaultMaxTokens, String backend) {
         this.modelDir = modelDir;
         this.defaultMaxTokens = defaultMaxTokens;
+        this.backend = backend != null ? backend : "cpu";
     }
 
     /**
@@ -68,12 +101,13 @@ public class Phi3InferenceEngine implements InferenceEngine {
      */
     public Phi3InferenceEngine(InferenceConfiguration config) {
         this(Path.of(config.getModelPath()),
-                config.getMaxTokens() > 0 ? config.getMaxTokens() : 256);
+                config.getMaxTokens() > 0 ? config.getMaxTokens() : 256,
+                config.getBackend());
     }
 
     @Override
     public void initialize() throws InferenceException {
-        log.info("Phi3InferenceEngine initializing from {}", modelDir);
+        log.info("Phi3InferenceEngine initializing from {} (backend={})", modelDir, backend);
 
         try {
             long t0 = System.currentTimeMillis();
@@ -94,11 +128,44 @@ public class Phi3InferenceEngine implements InferenceEngine {
             weights = Phi3Weights.load(modelDir, config);
             log.info("Weights loaded in {} ms", System.currentTimeMillis() - t0);
 
-            // Create runtime
-            runtime = new Phi3Runtime(config, weights, tokenizer);
+            // ── GPU acceleration ──────────────────────────────────────
+            if (!"cpu".equalsIgnoreCase(backend) && WindowsBindings.isSupported()) {
+                try {
+                    wb = new WindowsBindings();
+                    wb.init(backend);
+                    if (wb.hasDirectMl()) {
+                        int gpuLayers = Integer.getInteger("phi3.gpu.layers",
+                                config.numHiddenLayers());
+                        boolean gpuLmHead = Boolean.parseBoolean(
+                                System.getProperty("phi3.gpu.lmhead", "true"));
+                        gpuKernels = Phi3GpuKernels.create(
+                                wb, weights, config, gpuLayers, gpuLmHead);
+                        log.info("GPU acceleration: {}/{} layers on GPU, lmHead={}",
+                                gpuKernels.getGpuLayers(), config.numHiddenLayers(),
+                                gpuKernels.hasLmHead());
+                    } else {
+                        log.warn("DirectML device not available, falling back to CPU");
+                    }
+                } catch (Exception e) {
+                    if ("auto".equalsIgnoreCase(backend)) {
+                        log.warn("GPU initialization failed, falling back to CPU: {}",
+                                e.getMessage());
+                        cleanupGpu();
+                    } else {
+                        cleanupGpu();
+                        throw new InferenceException(
+                                "GPU initialization failed: " + e.getMessage(), e);
+                    }
+                }
+            }
+
+            // Create runtime (GPU kernels may be null → CPU-only)
+            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
 
             ready = true;
-            log.info("Phi3InferenceEngine ready ({}ms total)", System.currentTimeMillis() - t0);
+            log.info("Phi3InferenceEngine ready ({}ms total, backend={})",
+                    System.currentTimeMillis() - t0,
+                    gpuKernels != null ? "GPU(" + gpuKernels.getGpuLayers() + " layers)" : "CPU");
 
         } catch (IOException e) {
             throw new InferenceException("Failed to load Phi-3 model from " + modelDir, e);
@@ -150,6 +217,7 @@ public class Phi3InferenceEngine implements InferenceEngine {
     @Override
     public void shutdown() {
         ready = false;
+        cleanupGpu();
         if (weights != null) {
             try {
                 weights.close();
@@ -162,6 +230,22 @@ public class Phi3InferenceEngine implements InferenceEngine {
         tokenizer = null;
         config = null;
         log.info("Phi3InferenceEngine shut down");
+    }
+
+    /** Clean up GPU resources (idempotent). */
+    private void cleanupGpu() {
+        if (gpuKernels != null) {
+            try { gpuKernels.close(); } catch (Exception e) {
+                log.warn("Error closing GPU kernels: {}", e.getMessage());
+            }
+            gpuKernels = null;
+        }
+        if (wb != null) {
+            try { wb.close(); } catch (Exception e) {
+                log.warn("Error closing WindowsBindings: {}", e.getMessage());
+            }
+            wb = null;
+        }
     }
 
     @Override

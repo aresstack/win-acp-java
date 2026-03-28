@@ -10,7 +10,7 @@ package com.aresstack.winacp.inference;
  * <b>Implementations:</b>
  * <ul>
  *   <li>{@link Phi3InferenceEngine} — Phi-3-mini-4k-instruct text generation
- *       (CPU-first decode, INT4 AWQ weights, greedy sampling)</li>
+ *       (CPU or GPU-accelerated decode, INT4 AWQ weights, greedy sampling)</li>
  *   <li>{@link MnistDirectMlEngine} — 28×28 digit classification via DirectML</li>
  *   <li>{@link StubInferenceEngine} — Deterministic stub for testing without GPU</li>
  * </ul>
