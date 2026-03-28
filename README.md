@@ -12,18 +12,26 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 
 ---
 
-## V1 Scope – MNIST-family CNN · DirectML · Vertical Slice
+## V1 Scope – Small 28×28 Grayscale CNN · DirectML · Vertical Slice
 
-**V1 is a deliberate vertical slice:** MNIST-family CNN digit classification,
-one hardware path (DirectML on the GPU), one task (digit 0–9).
-Currently validated with `mnist-12.onnx` (float32, opset 12) and
-`mnist-12-int8.onnx` (int8 quantized, opset 12). Also compatible with
-`mnist-8.onnx` (float32, opset 8).
+**V1 scope:** small 28×28 grayscale CNN vertical slice, validated with
+`mnist-12.onnx`, `mnist-12-int8.onnx`, and `mnist_emnist_blank_cnn_v1.onnx`.
+
+| Model | Architecture | Output | Status |
+|---|---|---|---|
+| `mnist-12.onnx` | 2×Conv+ReLU, 2×MaxPool, Gemm (opset 12, float32) | 10 logits (digits 0–9) | ✅ |
+| `mnist-12-int8.onnx` | Same, int8 quantized (dequantize-first) | 10 logits (digits 0–9) | ✅ |
+| `mnist-8.onnx` | Same (opset 8, float32) | 10 logits (digits 0–9) | ✅ |
+| `mnist_emnist_blank_cnn_v1.onnx` | 3×Conv+ReLU, 2×MaxPool, Gemm+ReLU (BN folded), Gemm | 11 logits (digits 0–9 + blank) | ✅ |
+
+The EMNIST+blank model proves the pipeline handles a **second architecture**
+with different layer topology (3 convolutions, batch normalization in the
+classifier head, 11-class output). Dropout layers are absent in the ONNX
+graph (eliminated during PyTorch eval-mode export).
 
 The int8 model is supported via **dequantize-first**: quantized INT8 weights
 are dequantized to float32 at load time, then processed through the same
-DirectML operator pipeline. This proves that the parser and pipeline handle
-both float32 and quantized ONNX graphs for the MNIST architecture.
+DirectML operator pipeline.
 
 The entire stack – from Java 21 FFM calls through DXGI → D3D12 → DirectML →
 operator dispatch → argmax – is proven end-to-end with this model family.
