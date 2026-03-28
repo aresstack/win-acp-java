@@ -27,30 +27,39 @@ public final class MnistPipeline implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(MnistPipeline.class);
 
+    /** Detected model architecture. */
+    enum ModelArch { MNIST, EMNIST_BLANK }
+
     private final WindowsBindings wb;
     private Arena arena;
+    private ModelArch arch = ModelArch.MNIST;
+    private int outputSize = 10;
 
-    // ── Parsed weights ───────────────────────────────────────────────────
+    // ── Parsed weights (shared) ──────────────────────────────────────────
     private float[] conv1Filter, conv1Bias;
     private float[] conv2Filter, conv2Bias;
-    private float[] fcWeight, fcBias;
+    private float[] fcWeight, fcBias;  // final FC layer (MNIST: 256→10, EMNIST: 128→11 transposed)
+
+    // ── EMNIST-specific parsed weights ───────────────────────────────────
+    private float[] conv3Filter, conv3Bias;
+    private float[] fc1Weight, fc1Bias;  // first FC (6272→128, transposed)
+    private float[] bnWeight, bnBias, bnMean, bnVar;
 
     // ── GPU buffers (D3D12 default-heap, UAV) ────────────────────────────
-    private MemorySegment inputBuf;       // (1,1,28,28)  784
-    private MemorySegment conv1FBuf;      // (8,1,5,5)    200
-    private MemorySegment conv1BBuf;      // (1,8,1,1)      8
-    private MemorySegment conv1Out;       // (1,8,28,28)  6272
-    private MemorySegment pool1Out;       // (1,8,14,14)  1568
-    private MemorySegment conv2FBuf;      // (16,8,5,5)   3200
-    private MemorySegment conv2BBuf;      // (1,16,1,1)     16
-    private MemorySegment conv2Out;       // (1,16,14,14) 3136
-    private MemorySegment pool2Out;       // (1,16,4,4)    256
-    private MemorySegment fcWBuf;         // (1,1,256,10) 2560
-    private MemorySegment fcBBuf;         // (1,1,1,10)     10
-    private MemorySegment outputBuf;      // (1,1,1,10)     10
+    private MemorySegment inputBuf;
+    private MemorySegment conv1FBuf, conv1BBuf, conv1Out;
+    private MemorySegment conv2FBuf, conv2BBuf, conv2Out;
+    private MemorySegment pool1Out, pool2Out;
+    private MemorySegment fcWBuf, fcBBuf, outputBuf;
+    // EMNIST-only buffers
+    private MemorySegment conv3FBuf, conv3BBuf, conv3Out;
+    private MemorySegment fc1WBuf, fc1BBuf, fc1Out;
+    private MemorySegment bnWBuf, bnBBuf, bnMBuf, bnVBuf, bnOut;
 
     // ── Compiled DML operators ───────────────────────────────────────────
-    private MemorySegment compiledConv1, compiledPool1, compiledConv2, compiledPool2, compiledGemm;
+    private MemorySegment compiledConv1, compiledPool1;
+    private MemorySegment compiledConv2, compiledPool2;
+    private MemorySegment compiledGemm;
     private MemorySegment[] allCompiled;
 
     // ── DML infra ────────────────────────────────────────────────────────
@@ -60,9 +69,9 @@ public final class MnistPipeline implements AutoCloseable {
     private int totalDescriptors;
 
     // ── Temp / persistent resources per operator ─────────────────────────
-    private long[] tempSizes;       // [5]
-    private long[] persistSizes;    // [5]
-    private int[] descCounts;       // [5] – cached from allocateBindingResources
+    private long[] tempSizes;
+    private long[] persistSizes;
+    private int[] descCounts;
     private MemorySegment[] tempBufs;
     private MemorySegment[] persistBufs;
 
@@ -73,6 +82,9 @@ public final class MnistPipeline implements AutoCloseable {
         this.wb = Objects.requireNonNull(wb);
         this.arena = Arena.ofConfined();
     }
+
+    /** Returns the number of output logits (10 for MNIST, 11 for EMNIST). */
+    public int getOutputSize() { return outputSize; }
 
     // ══════════════════════════════════════════════════════════════════════
     //  Load model
@@ -91,7 +103,8 @@ public final class MnistPipeline implements AutoCloseable {
         initializeOperators();
 
         loaded = true;
-        log.info("MnistPipeline ready – 5 DML operators compiled and initialized");
+        log.info("MnistPipeline ready – {} DML operators, arch={}, outputSize={}",
+                allCompiled.length, arch, outputSize);
     }
 
     // ── Step 1: Extract weights from parsed ONNX graph ───────────────────

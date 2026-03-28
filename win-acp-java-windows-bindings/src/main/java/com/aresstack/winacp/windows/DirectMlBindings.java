@@ -36,6 +36,7 @@ public final class DirectMlBindings {
     // DML_OPERATOR_TYPE values (from DirectML.h – Windows SDK 10.0.26100.0)
     public static final int DML_OPERATOR_ELEMENT_WISE_IDENTITY = 1;
     public static final int DML_OPERATOR_ELEMENT_WISE_ADD        = 4;
+    public static final int DML_OPERATOR_BATCH_NORMALIZATION   = 29;
     public static final int DML_OPERATOR_ACTIVATION_RELU       = 44;
     public static final int DML_OPERATOR_CONVOLUTION            = 53;
     public static final int DML_OPERATOR_GEMM                   = 54;
@@ -46,7 +47,8 @@ public final class DirectMlBindings {
     public static final int DML_CONVOLUTION_DIRECTION_FORWARD      = 0;
 
     // DML_MATRIX_TRANSFORM
-    public static final int DML_MATRIX_TRANSFORM_NONE = 0;
+    public static final int DML_MATRIX_TRANSFORM_NONE      = 0;
+    public static final int DML_MATRIX_TRANSFORM_TRANSPOSE = 1;
 
     // DML_BINDING_TYPE
     public static final int DML_BINDING_TYPE_NONE   = 0;
