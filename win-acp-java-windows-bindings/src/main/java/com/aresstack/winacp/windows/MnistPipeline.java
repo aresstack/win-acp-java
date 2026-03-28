@@ -11,11 +11,13 @@ import java.util.*;
 /**
  * MNIST-specific DirectML inference pipeline.
  * <p>
- * V1 scope: MNIST-family CNN vertical slice, currently validated with
- * {@code mnist-12.onnx} (opset 12). Also compatible with {@code mnist-8.onnx}.
+ * V1 scope: MNIST-family CNN vertical slice, validated with
+ * {@code mnist-12.onnx} (float32) and {@code mnist-12-int8.onnx} (int8 quantized).
+ * Also compatible with {@code mnist-8.onnx}.
  * <p>
  * Loads the ONNX model, creates DirectML operators for each layer,
  * and runs inference entirely on the GPU via D3D12 + DirectML.
+ * Int8 quantized models are dequantized to float32 at load time.
  * <p>
  * Network: Input(1,1,28,28) → Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm → Output(1,10)
  * <p>
@@ -95,18 +97,32 @@ public final class MnistPipeline implements AutoCloseable {
     // ── Step 1: Extract weights from parsed ONNX graph ───────────────────
 
     private void extractWeights(OnnxModelReader.OnnxGraph graph) {
+        // Detect int8 quantized graph: QLinearConv is the marker
+        boolean isInt8 = graph.nodes().stream()
+                .anyMatch(n -> "QLinearConv".equals(n.opType()));
+
+        if (isInt8) {
+            extractWeightsInt8(graph);
+        } else {
+            extractWeightsFloat32(graph);
+        }
+
+        log.info("Weights ({}): conv1F={}, conv1B={}, conv2F={}, conv2B={}, fcW={}, fcB={}",
+                isInt8 ? "dequantized from int8" : "float32",
+                conv1Filter.length, conv1Bias.length, conv2Filter.length,
+                conv2Bias.length, fcWeight.length, fcBias.length);
+    }
+
+    // ── Float32 weight extraction (mnist-8, mnist-12) ────────────────────
+
+    private void extractWeightsFloat32(OnnxModelReader.OnnxGraph graph) {
         Map<String, OnnxModelReader.OnnxTensor> inits = graph.initializers();
 
         // Build maps for tracing data flow
-        Map<String, String> reshapeMap = new HashMap<>(); // reshape output → reshape input
-        Map<String, String> outputToNode = new HashMap<>(); // tensor name → producing node's opType
-
+        Map<String, String> reshapeMap = new HashMap<>();
         for (OnnxModelReader.OnnxNode node : graph.nodes()) {
             if ("Reshape".equals(node.opType()) && !node.inputs().isEmpty() && !node.outputs().isEmpty()) {
                 reshapeMap.put(node.outputs().get(0), node.inputs().get(0));
-            }
-            for (String out : node.outputs()) {
-                outputToNode.put(out, node.opType());
             }
         }
 
@@ -129,7 +145,6 @@ public final class MnistPipeline implements AutoCloseable {
                     OnnxModelReader.OnnxTensor f = resolveInitializer(node.inputs().get(1), inits, reshapeMap);
                     convFilters.add(f != null ? f.data() : new float[0]);
 
-                    // Look ahead for the Add node that provides the bias
                     float[] bias = null;
                     if (i + 1 < nodes.size() && "Add".equals(nodes.get(i + 1).opType())) {
                         var addNode = nodes.get(i + 1);
@@ -145,7 +160,6 @@ public final class MnistPipeline implements AutoCloseable {
                     if (w != null) matMulWeight = w.data();
                 }
                 case "Add" -> {
-                    // Only capture the final Add (after MatMul) as FC bias
                     if (matMulWeight != null && addBias == null) {
                         for (String in : node.inputs()) {
                             OnnxModelReader.OnnxTensor t = resolveInitializer(in, inits, reshapeMap);
@@ -162,10 +176,150 @@ public final class MnistPipeline implements AutoCloseable {
         conv2Bias   = convBiases.size() > 1 ? convBiases.get(1)  : new float[16];
         fcWeight    = matMulWeight != null ? matMulWeight : new float[2560];
         fcBias      = addBias != null ? addBias : new float[10];
+    }
 
-        log.info("Weights: conv1F={}, conv1B={}, conv2F={}, conv2B={}, fcW={}, fcB={}",
-                conv1Filter.length, conv1Bias.length, conv2Filter.length,
-                conv2Bias.length, fcWeight.length, fcBias.length);
+    // ── Int8 weight extraction + dequantization (mnist-12-int8) ──────────
+
+    /**
+     * Extract quantized weights from an int8 MNIST graph and dequantize to float32.
+     * <p>
+     * Int8 graph structure (from Intel Neural Compressor):
+     * <pre>
+     *   QuantizeLinear → QLinearConv(+ReLU+bias) → MaxPool  (×2)
+     *   DequantizeLinear → Reshape → QuantizeLinear → QLinearMatMul → QLinearAdd → DequantizeLinear
+     * </pre>
+     * Dequantization formula (per-channel): {@code float = scale[c] * (int8 - zero_point[c])}
+     */
+    private void extractWeightsInt8(OnnxModelReader.OnnxGraph graph) {
+        Map<String, OnnxModelReader.OnnxTensor> inits = graph.initializers();
+
+        // QLinearConv inputs: x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, B
+        // We need: w (quantized filter), w_scale, w_zp, B (quantized bias)
+        List<float[]> convFilters = new ArrayList<>();
+        List<float[]> convBiases = new ArrayList<>();
+
+        for (var node : graph.nodes()) {
+            if ("QLinearConv".equals(node.opType())) {
+                var inputs = node.inputs();
+                // inputs[3]=w_quantized, [4]=w_scale, [5]=w_zero_point
+                // inputs[1]=x_scale, [8]=bias_quantized (optional)
+                var wQuant = inits.get(inputs.get(3));
+                var wScale = inits.get(inputs.get(4));
+                var wZp    = inits.get(inputs.get(5));
+
+                convFilters.add(dequantizePerChannel(wQuant, wScale, wZp));
+
+                // Bias (input index 8): INT32, dequantized as bias = int32 * (x_scale * w_scale[c])
+                if (inputs.size() > 8) {
+                    var xScale = inits.get(inputs.get(1));
+                    var biasQuant = inits.get(inputs.get(8));
+                    convBiases.add(dequantizeBias(biasQuant, xScale, wScale));
+                } else {
+                    convBiases.add(new float[0]);
+                }
+            }
+        }
+
+        // QLinearMatMul inputs: a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp
+        float[] matMulWeight = null;
+        for (var node : graph.nodes()) {
+            if ("QLinearMatMul".equals(node.opType())) {
+                var inputs = node.inputs();
+                var bQuant = inits.get(inputs.get(3));
+                var bScale = inits.get(inputs.get(4));
+                var bZp    = inits.get(inputs.get(5));
+                matMulWeight = dequantizePerChannel(bQuant, bScale, bZp);
+                break;
+            }
+        }
+
+        // QLinearAdd: inputs a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp
+        // b = FC bias (Parameter194_quantized)
+        float[] fcBiasResult = null;
+        for (var node : graph.nodes()) {
+            if ("QLinearAdd".equals(node.opType())) {
+                var inputs = node.inputs();
+                var bQuant = inits.get(inputs.get(3));
+                var bScale = inits.get(inputs.get(4));
+                var bZp    = inits.get(inputs.get(5));
+                fcBiasResult = dequantizeFlat(bQuant, bScale, bZp);
+                break;
+            }
+        }
+
+        conv1Filter = convFilters.size() > 0 ? convFilters.get(0) : new float[200];
+        conv1Bias   = convBiases.size() > 0 ? convBiases.get(0)  : new float[8];
+        conv2Filter = convFilters.size() > 1 ? convFilters.get(1) : new float[3200];
+        conv2Bias   = convBiases.size() > 1 ? convBiases.get(1)  : new float[16];
+        fcWeight    = matMulWeight != null ? matMulWeight : new float[2560];
+        fcBias      = fcBiasResult != null ? fcBiasResult : new float[10];
+    }
+
+    /**
+     * Dequantize a per-channel quantized tensor: float[i] = scale[c] * (raw[i] - zp[c]).
+     * Channel dimension is dims[0] (output channels for conv filters, last dim for matmul).
+     */
+    private static float[] dequantizePerChannel(OnnxModelReader.OnnxTensor quant,
+                                                 OnnxModelReader.OnnxTensor scale,
+                                                 OnnxModelReader.OnnxTensor zp) {
+        if (quant == null || scale == null) return new float[0];
+
+        int totalElements = quant.elementCount();
+        int numChannels = scale.data().length;
+        int channelStride = numChannels > 0 ? totalElements / numChannels : totalElements;
+        float[] result = new float[totalElements];
+        byte[] raw = quant.rawBytes();
+
+        for (int i = 0; i < totalElements; i++) {
+            int channel = i / channelStride;
+            if (channel >= numChannels) channel = numChannels - 1;
+            float s = scale.getFloat(channel);
+            int zpVal = (zp != null && zp.rawBytes().length > channel) ? zp.getInt8(channel) : 0;
+            int qVal = (quant.dataType() == OnnxModelReader.ONNX_UINT8)
+                    ? (raw[i] & 0xFF) : raw[i]; // unsigned or signed
+            result[i] = s * (qVal - zpVal);
+        }
+        return result;
+    }
+
+    /**
+     * Dequantize a flat (per-tensor) quantized tensor: float[i] = scale * (raw[i] - zp).
+     */
+    private static float[] dequantizeFlat(OnnxModelReader.OnnxTensor quant,
+                                           OnnxModelReader.OnnxTensor scale,
+                                           OnnxModelReader.OnnxTensor zp) {
+        if (quant == null || scale == null) return new float[0];
+        int totalElements = quant.elementCount();
+        float s = scale.getFloat(0);
+        int zpVal = (zp != null && zp.rawBytes().length > 0) ? (zp.rawBytes()[0] & 0xFF) : 0;
+        float[] result = new float[totalElements];
+        byte[] raw = quant.rawBytes();
+
+        for (int i = 0; i < totalElements && i < raw.length; i++) {
+            int qVal = (quant.dataType() == OnnxModelReader.ONNX_UINT8)
+                    ? (raw[i] & 0xFF) : raw[i];
+            result[i] = s * (qVal - zpVal);
+        }
+        return result;
+    }
+
+    /**
+     * Dequantize INT32 bias: float[c] = int32[c] * (x_scale * w_scale[c]).
+     */
+    private static float[] dequantizeBias(OnnxModelReader.OnnxTensor biasQuant,
+                                           OnnxModelReader.OnnxTensor xScale,
+                                           OnnxModelReader.OnnxTensor wScale) {
+        if (biasQuant == null || xScale == null || wScale == null) return new float[0];
+        float xS = xScale.getFloat(0);
+        int count = biasQuant.elementCount();
+        float[] result = new float[count];
+
+        for (int c = 0; c < count; c++) {
+            int biasInt = biasQuant.getInt32(c);
+            float wS = wScale.getFloat(Math.min(c, wScale.data().length - 1));
+            result[c] = biasInt * xS * wS;
+        }
+        return result;
     }
 
     // ── Step 2: Create GPU buffers ───────────────────────────────────────

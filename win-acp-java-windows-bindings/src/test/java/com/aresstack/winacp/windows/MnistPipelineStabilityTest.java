@@ -22,22 +22,23 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class MnistPipelineStabilityTest {
 
-    private static final Path MODEL_PATH = findModelPath();
+    private static final Path MODEL_PATH = findModelPath("mnist-12.onnx");
+    private static final Path INT8_MODEL_PATH = findModelPath("mnist-12-int8.onnx");
 
-    private static Path findModelPath() {
-        for (String candidate : new String[]{
-                "model/mnist-12.onnx",
-                "../model/mnist-12.onnx",
-                "../../model/mnist-12.onnx"
-        }) {
-            Path p = Path.of(candidate);
+    private static Path findModelPath(String filename) {
+        for (String prefix : new String[]{"model/", "../model/", "../../model/"}) {
+            Path p = Path.of(prefix + filename);
             if (Files.exists(p)) return p;
         }
-        return Path.of("model/mnist-12.onnx");
+        return Path.of("model/" + filename);
     }
 
     static boolean modelExists() {
         return Files.exists(MODEL_PATH);
+    }
+
+    static boolean int8ModelExists() {
+        return Files.exists(INT8_MODEL_PATH);
     }
 
     // ── Multi-run: N consecutive inferences on same pipeline ─────────────
@@ -275,6 +276,103 @@ class MnistPipelineStabilityTest {
                 System.out.printf("mnist-12 regression: zeros→%d, ones→%d, 5-run consistent ✓%n",
                         digitZeros, MnistPipeline.argmax(outOnes));
             }
+        }
+    }
+
+    // ── Regression: mnist-12-int8 end-to-end ─────────────────────────────
+
+    /**
+     * Full regression test for mnist-12-int8.onnx: parse → dequantize → load → infer → consistency.
+     * Validates that the int8 quantized model produces reasonable outputs through the
+     * dequantize-first pipeline.
+     */
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    @EnabledIf("int8ModelExists")
+    void mnist12int8_regression_fullEndToEnd() throws Exception {
+        // 1. Parse: verify int8 graph structure
+        var graph = OnnxModelReader.parse(INT8_MODEL_PATH);
+        assertNotNull(graph, "Graph must parse");
+
+        long qConvCount = graph.nodes().stream()
+                .filter(n -> "QLinearConv".equals(n.opType())).count();
+        assertEquals(2, qConvCount, "Int8 MNIST should have 2 QLinearConv nodes");
+
+        assertTrue(graph.nodes().stream().anyMatch(n -> "QLinearMatMul".equals(n.opType())),
+                "Int8 MNIST should have QLinearMatMul");
+
+        // 2. Full inference pipeline (dequantize-first)
+        try (WindowsBindings wb = new WindowsBindings()) {
+            wb.init("auto");
+            if (!wb.hasDirectMl()) {
+                System.out.println("SKIP: DirectML not available");
+                return;
+            }
+
+            try (MnistPipeline pipeline = new MnistPipeline(wb)) {
+                pipeline.loadModel(INT8_MODEL_PATH);
+
+                // 3. Inference with zeros input
+                float[] zeros = new float[784];
+                float[] outZeros = pipeline.infer(zeros);
+                assertNotNull(outZeros);
+                assertEquals(10, outZeros.length, "MNIST output must be 10 logits");
+
+                int digitZeros = MnistPipeline.argmax(outZeros);
+                assertTrue(digitZeros >= 0 && digitZeros <= 9);
+
+                // 4. Multi-run consistency (3 runs)
+                for (int i = 0; i < 3; i++) {
+                    float[] repeat = pipeline.infer(zeros);
+                    assertArrayEquals(outZeros, repeat, 0f,
+                            "Int8 run " + i + " must match reference (deterministic)");
+                }
+
+                // 5. Different input, different output
+                float[] ones = new float[784];
+                java.util.Arrays.fill(ones, 1.0f);
+                float[] outOnes = pipeline.infer(ones);
+                assertFalse(java.util.Arrays.equals(outZeros, outOnes),
+                        "Different inputs must produce different logits (int8)");
+
+                System.out.printf("mnist-12-int8 regression: zeros→%d, ones→%d, 3-run consistent ✓%n",
+                        digitZeros, MnistPipeline.argmax(outOnes));
+            }
+        }
+    }
+
+    // ── Cross-model: float32 vs int8 produce same argmax ─────────────────
+
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    @EnabledIf("modelExists")
+    void float32VsInt8_sameArgmax_forZerosInput() throws Exception {
+        if (!Files.exists(INT8_MODEL_PATH)) {
+            System.out.println("SKIP: int8 model not available");
+            return;
+        }
+
+        try (WindowsBindings wb = new WindowsBindings()) {
+            wb.init("auto");
+            if (!wb.hasDirectMl()) return;
+
+            float[] input = new float[784]; // zeros
+
+            int f32Digit;
+            try (MnistPipeline f32 = new MnistPipeline(wb)) {
+                f32.loadModel(MODEL_PATH);
+                f32Digit = MnistPipeline.argmax(f32.infer(input));
+            }
+
+            int i8Digit;
+            try (MnistPipeline i8 = new MnistPipeline(wb)) {
+                i8.loadModel(INT8_MODEL_PATH);
+                i8Digit = MnistPipeline.argmax(i8.infer(input));
+            }
+
+            assertEquals(f32Digit, i8Digit,
+                    "Float32 and int8 should agree on argmax for zeros input");
+            System.out.printf("Cross-model: float32→%d, int8→%d ✓%n", f32Digit, i8Digit);
         }
     }
 }

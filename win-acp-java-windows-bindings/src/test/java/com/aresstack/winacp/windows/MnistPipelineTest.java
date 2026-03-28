@@ -13,30 +13,29 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Tests for the minimal ONNX protobuf parser and the MNIST DirectML pipeline.
  * <p>
- * V1 scope: MNIST-family CNN vertical slice, currently validated with
- * {@code mnist-12.onnx} (opset 12). The model file is expected at
- * {@code model/mnist-12.onnx} relative to the project root.
- * Tests that require the model are skipped if the file is not present.
+ * V1 scope: MNIST-family CNN vertical slice, validated with
+ * {@code mnist-12.onnx} (float32) and {@code mnist-12-int8.onnx} (quantized).
+ * Tests that require a model are skipped if the file is not present.
  */
 class MnistPipelineTest {
 
-    private static final Path MODEL_PATH = findModelPath();
+    private static final Path MODEL_PATH = findModelPath("mnist-12.onnx");
+    private static final Path INT8_MODEL_PATH = findModelPath("mnist-12-int8.onnx");
 
-    private static Path findModelPath() {
-        // Try relative paths from different working directories
-        for (String candidate : new String[]{
-                "model/mnist-12.onnx",
-                "../model/mnist-12.onnx",
-                "../../model/mnist-12.onnx"
-        }) {
-            Path p = Path.of(candidate);
+    private static Path findModelPath(String filename) {
+        for (String prefix : new String[]{"model/", "../model/", "../../model/"}) {
+            Path p = Path.of(prefix + filename);
             if (Files.exists(p)) return p;
         }
-        return Path.of("model/mnist-12.onnx"); // default, may not exist
+        return Path.of("model/" + filename);
     }
 
     static boolean modelExists() {
         return Files.exists(MODEL_PATH);
+    }
+
+    static boolean int8ModelExists() {
+        return Files.exists(INT8_MODEL_PATH);
     }
 
     // ── ONNX Parser Tests ────────────────────────────────────────────────
@@ -185,6 +184,83 @@ class MnistPipelineTest {
 
         float[] equal = {1.0f, 1.0f, 1.0f};
         assertEquals(0, MnistPipeline.argmax(equal)); // first max
+    }
+
+    // ── Int8 Model Tests ─────────────────────────────────────────────────
+
+    @Test
+    @EnabledIf("int8ModelExists")
+    void onnxParser_canParseInt8Model() throws Exception {
+        var graph = OnnxModelReader.parse(INT8_MODEL_PATH);
+        assertNotNull(graph);
+        assertFalse(graph.nodes().isEmpty(), "Graph should have nodes");
+        assertFalse(graph.initializers().isEmpty(), "Graph should have initializers");
+
+        // Int8 graph should have quantized operators
+        assertTrue(graph.nodes().stream().anyMatch(n -> "QLinearConv".equals(n.opType())),
+                "Int8 model should have QLinearConv nodes");
+
+        // Should have quantized initializers (INT8 tensors with rawBytes)
+        boolean hasInt8Tensor = graph.initializers().values().stream()
+                .anyMatch(t -> t.dataType() == OnnxModelReader.ONNX_INT8 && t.rawBytes().length > 0);
+        assertTrue(hasInt8Tensor, "Int8 model should have INT8 tensors with raw data");
+
+        System.out.println("Int8 graph: " + graph.nodes().size() + " nodes, "
+                + graph.initializers().size() + " initializers");
+        for (var node : graph.nodes()) {
+            System.out.printf("  %s: in=%d, out=%d%n",
+                    node.opType(), node.inputs().size(), node.outputs().size());
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    @EnabledIf("int8ModelExists")
+    void mnistInt8Pipeline_fullInference_producesOutput() throws Exception {
+        try (WindowsBindings wb = new WindowsBindings()) {
+            wb.init("auto");
+            if (!wb.hasDirectMl()) {
+                System.out.println("SKIP: DirectML not available");
+                return;
+            }
+
+            try (MnistPipeline pipeline = new MnistPipeline(wb)) {
+                pipeline.loadModel(INT8_MODEL_PATH);
+
+                float[] input = new float[784];
+                float[] output = pipeline.infer(input);
+
+                assertNotNull(output);
+                assertEquals(10, output.length, "MNIST output should have 10 logits");
+
+                int predicted = MnistPipeline.argmax(output);
+                assertTrue(predicted >= 0 && predicted <= 9);
+
+                System.out.println("Int8 MNIST output: " + java.util.Arrays.toString(output));
+                System.out.println("Int8 predicted digit (zeros): " + predicted);
+            }
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    @EnabledIf("int8ModelExists")
+    void mnistInt8Pipeline_multipleInferences_consistent() throws Exception {
+        try (WindowsBindings wb = new WindowsBindings()) {
+            wb.init("auto");
+            if (!wb.hasDirectMl()) return;
+
+            try (MnistPipeline pipeline = new MnistPipeline(wb)) {
+                pipeline.loadModel(INT8_MODEL_PATH);
+
+                float[] input = new float[784];
+                float[] out1 = pipeline.infer(input);
+                float[] out2 = pipeline.infer(input);
+
+                assertArrayEquals(out1, out2, 1e-6f, "Same input should produce same output (int8)");
+                System.out.println("Int8 consistency check: ✓");
+            }
+        }
     }
 }
 

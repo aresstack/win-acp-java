@@ -27,11 +27,46 @@ public final class OnnxModelReader {
 
     // ── Public data types ────────────────────────────────────────────────
 
-    public record OnnxTensor(String name, long[] dims, int dataType, float[] data) {
+    /** ONNX data type constants. */
+    public static final int ONNX_FLOAT = 1, ONNX_UINT8 = 2, ONNX_INT8 = 3,
+            ONNX_INT32 = 6, ONNX_INT64 = 7;
+
+    /**
+     * Parsed ONNX tensor. {@code data} holds float values (for FLOAT type or
+     * after conversion). {@code rawBytes} holds the raw byte payload for
+     * non-FLOAT types (INT8, UINT8, INT32). Both may be populated.
+     */
+    public record OnnxTensor(String name, long[] dims, int dataType,
+                              float[] data, byte[] rawBytes) {
+        /** Convenience constructor for float-only tensors (backward compat). */
+        public OnnxTensor(String name, long[] dims, int dataType, float[] data) {
+            this(name, dims, dataType, data, new byte[0]);
+        }
+
         public int elementCount() {
             int n = 1;
             for (long d : dims) n *= (int) d;
             return n;
+        }
+
+        /** Read a single signed int8 value from rawBytes. */
+        public byte getInt8(int index) { return rawBytes[index]; }
+
+        /** Read a single unsigned uint8 value from rawBytes. */
+        public int getUint8(int index) { return rawBytes[index] & 0xFF; }
+
+        /** Read a little-endian int32 from rawBytes at element index. */
+        public int getInt32(int index) {
+            int off = index * 4;
+            return (rawBytes[off] & 0xFF)
+                    | ((rawBytes[off + 1] & 0xFF) << 8)
+                    | ((rawBytes[off + 2] & 0xFF) << 16)
+                    | ((rawBytes[off + 3] & 0xFF) << 24);
+        }
+
+        /** Read a single float from the data array, or 0 if out of bounds. */
+        public float getFloat(int index) {
+            return index < data.length ? data[index] : 0f;
         }
     }
 
@@ -227,6 +262,7 @@ public final class OnnxModelReader {
         String name = "";
         float[] floatData = null;
         byte[] rawData = null;
+        List<Integer> int32Values = null; // from field 5 (packed varints)
 
         while (buf.position() < end) {
             int tag = readVarint32(buf);
@@ -246,22 +282,32 @@ public final class OnnxModelReader {
                     if (wireType == 0) dataType = readVarint32(buf);
                     else skipField(buf, wireType);
                 }
-                case 4 -> { // repeated float float_data (packed)
+                case 4 -> { // repeated float float_data (packed fixed32)
                     if (wireType == 2) {
                         int len = readVarint32(buf);
                         int count = len / 4;
                         floatData = new float[count];
                         for (int i = 0; i < count; i++) floatData[i] = Float.intBitsToFloat(buf.getInt());
                     } else if (wireType == 5) {
-                        // Single float (non-packed) — rare for tensors
                         floatData = new float[]{ Float.intBitsToFloat(buf.getInt()) };
                     } else skipField(buf, wireType);
                 }
-                case 8 -> { // string name — wait, TensorProto.name is field 8
+                case 5 -> { // repeated int32 int32_data (packed varints)
+                    if (wireType == 2) {
+                        int len = readVarint32(buf);
+                        int pEnd = buf.position() + len;
+                        int32Values = new ArrayList<>();
+                        while (buf.position() < pEnd) int32Values.add(readVarint32(buf));
+                    } else if (wireType == 0) {
+                        if (int32Values == null) int32Values = new ArrayList<>();
+                        int32Values.add(readVarint32(buf));
+                    } else skipField(buf, wireType);
+                }
+                case 8 -> { // string name
                     if (wireType == 2) name = readString(buf);
                     else skipField(buf, wireType);
                 }
-                case 13 -> { // bytes raw_data
+                case 9, 13 -> { // raw byte data (field 13 = raw_data, field 9 = quantized data variant)
                     if (wireType == 2) {
                         int len = readVarint32(buf);
                         rawData = new byte[len];
@@ -272,21 +318,50 @@ public final class OnnxModelReader {
             }
         }
 
-        // Convert raw_data to float[] if needed
+        // Build the final float[] and byte[] based on data type
         float[] data;
+        byte[] rawBytes;
+
         if (floatData != null) {
+            // FLOAT tensor with explicit float_data
             data = floatData;
-        } else if (rawData != null && dataType == 1) { // FLOAT
+            rawBytes = new byte[0];
+        } else if (rawData != null && dataType == ONNX_FLOAT) {
+            // FLOAT tensor with raw_data
             ByteBuffer rb = ByteBuffer.wrap(rawData).order(ByteOrder.LITTLE_ENDIAN);
             data = new float[rawData.length / 4];
             for (int i = 0; i < data.length; i++) data[i] = rb.getFloat();
+            rawBytes = new byte[0];
+        } else if (rawData != null) {
+            // Non-FLOAT tensor with raw byte data (INT8, UINT8, INT32)
+            data = new float[0];
+            rawBytes = rawData;
+        } else if (int32Values != null) {
+            // Non-FLOAT tensor with int32_data (varint-encoded, used for zero_points)
+            data = new float[0];
+            if (dataType == ONNX_INT8 || dataType == ONNX_UINT8) {
+                // Store each int32 value as a single byte
+                rawBytes = new byte[int32Values.size()];
+                for (int i = 0; i < int32Values.size(); i++)
+                    rawBytes[i] = int32Values.get(i).byteValue();
+            } else if (dataType == ONNX_INT32) {
+                // Store as little-endian int32 bytes
+                rawBytes = new byte[int32Values.size() * 4];
+                ByteBuffer bb = ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN);
+                for (int v : int32Values) bb.putInt(v);
+            } else {
+                rawBytes = new byte[0];
+            }
         } else {
             data = new float[0];
+            rawBytes = new byte[0];
         }
 
         long[] dimsArr = dims.stream().mapToLong(Long::longValue).toArray();
-        log.debug("Tensor '{}': dims={}, dataType={}, elements={}", name, Arrays.toString(dimsArr), dataType, data.length);
-        return new OnnxTensor(name, dimsArr, dataType, data);
+        int elementCount = (data.length > 0) ? data.length : rawBytes.length;
+        log.debug("Tensor '{}': dims={}, dataType={}, floats={}, rawBytes={}",
+                name, Arrays.toString(dimsArr), dataType, data.length, rawBytes.length);
+        return new OnnxTensor(name, dimsArr, dataType, data, rawBytes);
     }
 
     // ── ValueInfoProto (just extract name) ───────────────────────────────

@@ -13,11 +13,12 @@ import java.util.Arrays;
 /**
  * MNIST digit-classification engine backed by DirectML on the GPU.
  * <p>
- * <b>V1 scope:</b> MNIST-family CNN vertical slice, currently validated
- * with {@code mnist-12.onnx} (opset 12). Classifies 28×28 grayscale images
- * into digits 0–9. It is <em>not</em> a general-purpose ONNX inference
- * engine, nor a text-generation / chat model. Generalized model support
- * is a future milestone.
+ * <b>V1 scope:</b> MNIST-family CNN vertical slice, validated with
+ * {@code mnist-12.onnx} (float32) and {@code mnist-12-int8.onnx} (int8
+ * quantized). Classifies 28×28 grayscale images into digits 0–9.
+ * It is <em>not</em> a general-purpose ONNX inference engine, nor a
+ * text-generation / chat model. Generalized model support is a future
+ * milestone.
  * <p>
  * Pipeline: DXGI → D3D12 → DirectML → 5 compiled operators
  * (Conv+Relu → MaxPool → Conv+Relu → MaxPool → Gemm) → argmax.
