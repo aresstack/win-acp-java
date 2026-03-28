@@ -59,8 +59,8 @@ class Phi3ChatCLITest {
 
     @Test
     void maxTokensCommandUnlimited() {
-        String output = runCli("/maxTokens -1", "/exit");
-        assertTrue(output.contains("unlimited"), "Should accept -1 as unlimited");
+        String output = runCli("/maxTokens 0", "/exit");
+        assertTrue(output.contains("unlimited"), "Should accept 0 as unlimited");
     }
 
     @Test
@@ -76,9 +76,9 @@ class Phi3ChatCLITest {
     }
 
     @Test
-    void maxTokensCommandZeroRejected() {
-        String output = runCli("/maxTokens 0", "/exit");
-        assertTrue(output.contains("\"type\":\"error\""), "Should reject 0");
+    void maxTokensCommandNegativeRejected() {
+        String output = runCli("/maxTokens -1", "/exit");
+        assertTrue(output.contains("\"type\":\"error\""), "Should reject negative values");
     }
 
     @Test
