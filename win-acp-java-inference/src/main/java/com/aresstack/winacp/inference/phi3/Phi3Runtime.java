@@ -176,7 +176,7 @@ public final class Phi3Runtime {
 
         // Build profile summary
         lastProfile = buildProfileSummary();
-        System.out.println(lastProfile);
+        log.debug("Profile: {}", lastProfile);
 
         return previousText;
     }
@@ -196,20 +196,23 @@ public final class Phi3Runtime {
         double totalMs = totalDecode / 1e6;
         double perToken = totalMs / profSteps;
 
+        // Guard against division by zero if totalDecode is 0
+        double pctDivisor = totalDecode > 0 ? totalDecode : 1;
+
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("[Decode Profile] %d tokens, %.1f ms total, %.1f ms/token%n", profSteps, totalMs, perToken));
         sb.append(String.format("  Prefill:         %.1f ms (%d prompt tokens)%n", profPrefillNs / 1e6, cachedSeqLen - profSteps));
         sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [%d calls/tok × 32 layers]%n",
-                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / totalDecode,
+                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor,
                 gpuKernels != null ? 6 : 0));
         sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%)%n",
-                profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / totalDecode));
+                profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor));
         sb.append(String.format("  CPU norms+RoPE:  %.1f ms avg (%.0f%%)%n",
-                profCpuNormNs / 1e6 / profSteps, 100.0 * profCpuNormNs / totalDecode));
+                profCpuNormNs / 1e6 / profSteps, 100.0 * profCpuNormNs / pctDivisor));
         sb.append(String.format("  CPU SwiGLU:      %.1f ms avg (%.0f%%)%n",
-                profCpuActNs / 1e6 / profSteps, 100.0 * profCpuActNs / totalDecode));
+                profCpuActNs / 1e6 / profSteps, 100.0 * profCpuActNs / pctDivisor));
         sb.append(String.format("  LM head:         %.1f ms avg (%.0f%%)%n",
-                profLmHeadNs / 1e6 / profSteps, 100.0 * profLmHeadNs / totalDecode));
+                profLmHeadNs / 1e6 / profSteps, 100.0 * profLmHeadNs / pctDivisor));
         sb.append(String.format("  Token decode:    %.1f ms avg%n", profTokenDecNs / 1e6 / profSteps));
         return sb.toString();
     }

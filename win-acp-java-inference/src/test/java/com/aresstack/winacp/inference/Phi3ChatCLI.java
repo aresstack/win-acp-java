@@ -90,11 +90,20 @@ public class Phi3ChatCLI {
 
     // ── Output writer (always stdout, one JSON per line) ─────────────────
     private final PrintWriter out;
+    private final boolean skipModelLoading;
 
     // ══════════════════════════════════════════════════════════════════════
 
     public Phi3ChatCLI(PrintWriter out) {
+        this(out, false);
+    }
+
+    /**
+     * @param skipModelLoading if {@code true}, skip model loading (for unit tests)
+     */
+    Phi3ChatCLI(PrintWriter out, boolean skipModelLoading) {
         this.out = out;
+        this.skipModelLoading = skipModelLoading;
     }
 
     public static void main(String[] args) {
@@ -109,7 +118,11 @@ public class Phi3ChatCLI {
 
     public void run(Scanner scanner) {
         emitSystem("ready", "Phi3ChatCLI started. Loading model from: " + MODEL_DIR.toAbsolutePath());
-        loadModel();
+        if (!skipModelLoading) {
+            loadModel();
+        } else {
+            emitSystem("skip", "Model loading skipped (test mode).");
+        }
 
         while (scanner.hasNextLine()) {
             String line = scanner.nextLine().trim();
@@ -238,12 +251,12 @@ public class Phi3ChatCLI {
         String sysPrompt = stringVal(request, "systemPrompt");
         if (sysPrompt == null) sysPrompt = systemPrompt;
 
-        // Record user message and build multi-turn prompt
-        conversationHistory.add(ChatMessage.user(prompt));
+        // Build multi-turn prompt (user message added to history AFTER successful generation)
+        List<ChatMessage> pendingHistory = new ArrayList<>(conversationHistory);
+        pendingHistory.add(ChatMessage.user(prompt));
 
         try {
-            String formatted = tokenizer.formatMultiTurnChat(sysPrompt, conversationHistory);
-            runtime.resetCache();
+            String formatted = tokenizer.formatMultiTurnChat(sysPrompt, pendingHistory);
 
             long t0 = System.nanoTime();
             final int[] tokenCount = {0};
@@ -259,9 +272,11 @@ public class Phi3ChatCLI {
             long elapsedNs = System.nanoTime() - t0;
             double elapsedMs = elapsedNs / 1e6;
             double msPerToken = tokenCount[0] > 0 ? elapsedMs / tokenCount[0] : 0;
-            double tokensPerSec = tokenCount[0] > 0 ? tokenCount[0] / (elapsedMs / 1000.0) : 0;
+            double tokensPerSec = (tokenCount[0] > 0 && elapsedMs > 0)
+                    ? tokenCount[0] / (elapsedMs / 1000.0) : 0;
 
-            // Record assistant message for future turns
+            // Record both messages only after successful generation
+            conversationHistory.add(ChatMessage.user(prompt));
             conversationHistory.add(ChatMessage.assistant(response));
 
             // Build timing info

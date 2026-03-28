@@ -307,10 +307,10 @@ public class Phi3ChatUI {
 
         new Thread(() -> {
             try {
-                // Build multi-turn prompt with full conversation history
-                conversationMessages.add(ChatMessage.user(userText));
-                String prompt = tokenizer.formatMultiTurnChat(SYSTEM_PROMPT, conversationMessages);
-                runtime.resetCache();
+                // Build multi-turn prompt (user message committed to history only after success)
+                List<ChatMessage> pendingHistory = new ArrayList<>(conversationMessages);
+                pendingHistory.add(ChatMessage.user(userText));
+                String prompt = tokenizer.formatMultiTurnChat(SYSTEM_PROMPT, pendingHistory);
 
                 // Start bot message (streaming)
                 SwingUtilities.invokeLater(this::startBotMessage);
@@ -325,7 +325,8 @@ public class Phi3ChatUI {
                             SwingUtilities.invokeLater(() -> appendBotChunk(delta));
                         });
 
-                // Record assistant response for future turns
+                // Record both messages only after successful generation
+                conversationMessages.add(ChatMessage.user(userText));
                 conversationMessages.add(ChatMessage.assistant(response));
 
                 long elapsed = System.currentTimeMillis() - t0;
