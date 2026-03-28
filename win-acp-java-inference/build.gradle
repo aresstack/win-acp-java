@@ -18,6 +18,8 @@ dependencies {
 }
 
 // FFM native access is needed because the windows-bindings module uses it at runtime
+// Phi-3 weight loading requires extra heap for the ~2GB model (embedding alone is ~400MB fp32)
 tasks.withType(Test).configureEach {
     jvmArgs '--enable-native-access=ALL-UNNAMED'
+    maxHeapSize = '4g'
 }

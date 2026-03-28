@@ -518,7 +518,11 @@ public final class Phi3Weights implements AutoCloseable {
                     if (wireType == 2) name = readString(buf);
                     else skipField(buf, wireType);
                 }
-                case 14 -> { // external_data (repeated StringStringEntryProto)
+                case 13 -> { // external_data (repeated StringStringEntryProto) — field 13 in this ONNX variant
+                    // NOTE: In this ONNX model variant, external_data is encoded as field 13
+                    // (sharing the field number with raw_data). We distinguish by checking wire type:
+                    // raw_data is bytes (wireType=2), StringStringEntryProto is also wireType=2 but
+                    // we parse the content to detect key-value pairs.
                     if (wireType == 2) {
                         int len = readVarint32(buf);
                         int eEnd = buf.position() + len;
@@ -532,7 +536,25 @@ public final class Phi3Weights implements AutoCloseable {
                         }
                     } else skipField(buf, wireType);
                 }
-                case 15 -> { // data_location enum
+                case 14 -> { // data_location enum OR external_data (depending on ONNX proto version)
+                    if (wireType == 0) {
+                        // data_location as varint (this ONNX variant)
+                        dataLocation = readVarint32(buf);
+                    } else if (wireType == 2) {
+                        // external_data as StringStringEntryProto (standard ONNX spec)
+                        int len = readVarint32(buf);
+                        int eEnd = buf.position() + len;
+                        String[] kv = parseStringStringEntry(buf, eEnd);
+                        buf.position(eEnd);
+                        if (kv != null) {
+                            switch (kv[0]) {
+                                case "offset" -> extOffset = Long.parseLong(kv[1]);
+                                case "length" -> extLength = Long.parseLong(kv[1]);
+                            }
+                        }
+                    } else skipField(buf, wireType);
+                }
+                case 15 -> { // data_location enum (standard ONNX spec)
                     if (wireType == 0) dataLocation = readVarint32(buf);
                     else skipField(buf, wireType);
                 }

@@ -337,7 +337,7 @@ public final class OnnxModelReader {
             data = new float[0];
             rawBytes = rawData;
         } else if (int32Values != null) {
-            // Non-FLOAT tensor with int32_data (varint-encoded, used for zero_points)
+            // Non-FLOAT tensor with int32_data (varint-encoded)
             data = new float[0];
             if (dataType == ONNX_INT8 || dataType == ONNX_UINT8) {
                 // Store each int32 value as a single byte
@@ -349,6 +349,13 @@ public final class OnnxModelReader {
                 rawBytes = new byte[int32Values.size() * 4];
                 ByteBuffer bb = ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN);
                 for (int v : int32Values) bb.putInt(v);
+            } else if (dataType == ONNX_FLOAT16) {
+                // FP16: ONNX stores fp16 values in int32_data.
+                // Each int32 contains ONE fp16 value in its lower 16 bits.
+                // Convert to raw little-endian fp16 bytes (2 bytes per value).
+                rawBytes = new byte[int32Values.size() * 2];
+                ByteBuffer bb = ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN);
+                for (int v : int32Values) bb.putShort((short) (v & 0xFFFF));
             } else {
                 rawBytes = new byte[0];
             }
