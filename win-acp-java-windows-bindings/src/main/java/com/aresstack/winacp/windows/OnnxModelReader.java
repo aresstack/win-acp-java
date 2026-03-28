@@ -29,7 +29,7 @@ public final class OnnxModelReader {
 
     /** ONNX data type constants. */
     public static final int ONNX_FLOAT = 1, ONNX_UINT8 = 2, ONNX_INT8 = 3,
-            ONNX_INT32 = 6, ONNX_INT64 = 7;
+            ONNX_INT32 = 6, ONNX_INT64 = 7, ONNX_FLOAT16 = 10;
 
     /**
      * Parsed ONNX tensor. {@code data} holds float values (for FLOAT type or
