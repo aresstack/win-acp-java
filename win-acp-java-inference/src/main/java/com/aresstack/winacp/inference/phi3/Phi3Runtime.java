@@ -160,42 +160,11 @@ public final class Phi3Runtime {
         return lastProfile;
     }
 
-    // ── Repetition control parameters ────────────────────────────────────
-
-    /** Penalty factor for tokens already in the generated output. (1.0 = off) */
-    private float repetitionPenalty = 1.2f;
-
-    /**
-     * Maximum number of consecutive identical tokens before generation is
-     * stopped early (safety brake against stuck loops).
-     */
-    private int maxConsecutiveRepeats = 8;
-
-    /**
-     * Set the repetition penalty factor (1.0 = no penalty).
-     * Typical values: 1.1 – 1.3.
-     */
-    public void setRepetitionPenalty(float penalty) {
-        this.repetitionPenalty = Math.max(1.0f, penalty);
-    }
-
-    /**
-     * Set the maximum allowed consecutive identical tokens before early stop.
-     * Use 0 to disable the check.
-     */
-    public void setMaxConsecutiveRepeats(int max) {
-        this.maxConsecutiveRepeats = max;
-    }
-
     /**
      * Generate tokens greedily with a per-token streaming callback.
      * <p>
      * Token IDs are accumulated and decoded as a full sequence after each
      * step so that SentencePiece inter-token spaces are preserved correctly.
-     * <p>
-     * Includes a <b>repetition penalty</b> (reduces logit scores of already
-     * generated tokens) and a <b>stuck-loop breaker</b> (stops when the same
-     * token is emitted more than {@link #maxConsecutiveRepeats} times in a row).
      *
      * @param prompt    text prompt
      * @param maxTokens maximum number of tokens to generate
@@ -242,33 +211,12 @@ public final class Phi3Runtime {
         // ── Decode loop ──────────────────────────────────────────────
         List<Integer> generatedIds = new ArrayList<>();
         String previousText = "";
-        int consecutiveCount = 0;  // how many times the same token appeared in a row
-        int lastTokenId = -1;      // previous token (for stuck detection)
 
         for (int step = 0; step < maxTokens; step++) {
-
-            // ── Apply repetition penalty to logits ──────────────────
-            if (repetitionPenalty > 1.0f && !generatedIds.isEmpty()) {
-                applyRepetitionPenalty(logits, generatedIds);
-            }
-
             int nextToken = argmax(logits);
 
             if (tokenizer.isEos(nextToken)) {
                 break;
-            }
-
-            // ── Stuck-loop detection ────────────────────────────────
-            if (nextToken == lastTokenId) {
-                consecutiveCount++;
-                if (maxConsecutiveRepeats > 0 && consecutiveCount >= maxConsecutiveRepeats) {
-                    log.warn("Stuck loop detected: token {} repeated {} times — stopping generation",
-                            nextToken, consecutiveCount);
-                    break;
-                }
-            } else {
-                consecutiveCount = 1;
-                lastTokenId = nextToken;
             }
 
             generatedIds.add(nextToken);
@@ -298,26 +246,6 @@ public final class Phi3Runtime {
         log.debug("Profile: {}", lastProfile);
 
         return previousText;
-    }
-
-    /**
-     * Apply repetition penalty to logits for all tokens that have already
-     * been generated.  Positive logits are divided by the penalty, negative
-     * logits are multiplied — so repeated tokens are always pushed down.
-     */
-    private void applyRepetitionPenalty(float[] logits, List<Integer> generatedIds) {
-        // Use a small boolean set to avoid penalising the same id twice
-        boolean[] seen = new boolean[logits.length];
-        for (int id : generatedIds) {
-            if (id >= 0 && id < logits.length && !seen[id]) {
-                seen[id] = true;
-                if (logits[id] > 0) {
-                    logits[id] /= repetitionPenalty;
-                } else {
-                    logits[id] *= repetitionPenalty;
-                }
-            }
-        }
     }
 
     // ── Profiling ────────────────────────────────────────────────────────
