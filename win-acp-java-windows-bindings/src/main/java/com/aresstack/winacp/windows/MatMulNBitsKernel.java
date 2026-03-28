@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
 import java.util.Arrays;
 
 /**
@@ -73,6 +74,15 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     private MemorySegment execBindingTable; // reusable DML binding table
     private MemorySegment execFence;        // reusable fence (value increments per call)
     private long fenceValue;                // monotonically increasing fence counter
+
+    // ── Pre-allocated barrier/heap structs for zero-alloc hot path (V1.2) ─
+    private MemorySegment barrierInputToUAV;      // transition: COPY_DEST → UAV
+    private MemorySegment barrierUAV;              // UAV barrier (no resource)
+    private MemorySegment barrierOutputToCS;       // transition: UAV → COPY_SOURCE
+    private MemorySegment barrierInputToCommon;    // transition: UAV → COMMON
+    private MemorySegment barrierOutputToCommon;   // transition: COPY_SOURCE → COMMON
+    private MemorySegment heapArrayPtr;            // single-element heap array for SetDescriptorHeaps
+    private MemorySegment cmdListArrayPtr;         // single-element cmd list array for ExecuteCommandLists
 
     private boolean prepared = false;
     private boolean closed = false;
@@ -225,9 +235,22 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         log.info("MatMulNBitsKernel ready: [{}, {}] on GPU (optimized single-submit)", N, K);
     }
 
+    // ── Pre-cached MethodHandles for zero-overhead hot path (V1.2) ──────
+    private MethodHandle mhResetAllocator;
+    private MethodHandle mhResetCmdList;
+    private MethodHandle mhCopyBufferRegion;
+    private MethodHandle mhResourceBarrier;
+    private MethodHandle mhSetDescriptorHeaps;
+    private MethodHandle mhCloseCmdList;
+    private MethodHandle mhExecuteCmdLists;
+    private MethodHandle mhQueueSignal;
+    private MethodHandle mhFenceGetCompleted;
+    private MethodHandle mhRecordDispatch;
+
     /**
      * Pre-allocate all per-call resources: staging buffers (persistently mapped),
-     * command allocator, command list, fence, and binding table.
+     * command allocator, command list, fence, binding table, barrier structs,
+     * and MethodHandle cache.
      */
     private void prepareExecInfra(MemorySegment dev, MemorySegment dml,
                                    long inputBytes, long outputBytes)
@@ -249,6 +272,78 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         // Reusable fence
         execFence = D3D12Bindings.createFence(dev, 0, arena);
         fenceValue = 0;
+
+        // ── Pre-allocate barrier structs (V1.2 — eliminates per-call Arena) ──
+        // Transition barrier: input COPY_DEST → UAV
+        barrierInputToUAV = allocTransitionBarrier(inputBuf,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // UAV barrier (all resources)
+        barrierUAV = arena.allocate(32, 8);
+        barrierUAV.set(ValueLayout.JAVA_INT, 0, D3D12Bindings.D3D12_RESOURCE_BARRIER_TYPE_UAV);
+        barrierUAV.set(ValueLayout.JAVA_INT, 4, D3D12Bindings.D3D12_RESOURCE_BARRIER_FLAG_NONE);
+        barrierUAV.set(ValueLayout.ADDRESS, 8, MemorySegment.NULL);
+        // Transition barrier: output UAV → COPY_SOURCE
+        barrierOutputToCS = allocTransitionBarrier(outputBuf,
+                D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // Transition barrier: input UAV → COMMON
+        barrierInputToCommon = allocTransitionBarrier(inputBuf,
+                D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COMMON);
+        // Transition barrier: output COPY_SOURCE → COMMON
+        barrierOutputToCommon = allocTransitionBarrier(outputBuf,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COMMON);
+        // Heap array for SetDescriptorHeaps
+        heapArrayPtr = arena.allocate(ValueLayout.ADDRESS);
+        heapArrayPtr.set(ValueLayout.ADDRESS, 0, descriptorHeap);
+        // CmdList array for ExecuteCommandLists
+        cmdListArrayPtr = arena.allocate(ValueLayout.ADDRESS);
+        cmdListArrayPtr.set(ValueLayout.ADDRESS, 0, execCmdList);
+
+        // ── Pre-cache MethodHandles for the hot path (V1.2) ──────────────
+        var queue = wb.getCommandQueue();
+        // ID3D12CommandAllocator::Reset (vtable slot 8)
+        mhResetAllocator = DxgiBindings.vtableMethod(execAllocator, 8,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        // ID3D12GraphicsCommandList::Reset (vtable slot 10) — (this, pAllocator, pInitialState)
+        mhResetCmdList = DxgiBindings.vtableMethod(execCmdList, 10,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+        // ID3D12GraphicsCommandList::CopyBufferRegion (vtable slot 15)
+        mhCopyBufferRegion = DxgiBindings.vtableMethod(execCmdList, 15,
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                        ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                        ValueLayout.JAVA_LONG));
+        // ID3D12GraphicsCommandList::ResourceBarrier (vtable slot 26)
+        mhResourceBarrier = DxgiBindings.vtableMethod(execCmdList, 26,
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS,
+                        ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        // ID3D12GraphicsCommandList::SetDescriptorHeaps (vtable slot 28)
+        mhSetDescriptorHeaps = DxgiBindings.vtableMethod(execCmdList, 28,
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS,
+                        ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        // ID3D12GraphicsCommandList::Close (vtable slot 9)
+        mhCloseCmdList = DxgiBindings.vtableMethod(execCmdList, 9,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        // ID3D12CommandQueue::ExecuteCommandLists (vtable slot 10)
+        mhExecuteCmdLists = DxgiBindings.vtableMethod(queue, 10,
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS,
+                        ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        // ID3D12CommandQueue::Signal (vtable slot 14)
+        mhQueueSignal = DxgiBindings.vtableMethod(queue, 14,
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+        // ID3D12Fence::GetCompletedValue (vtable slot 8)
+        mhFenceGetCompleted = DxgiBindings.vtableMethod(execFence, 8,
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+        // IDMLCommandRecorder::RecordDispatch (vtable slot RECORDER_RECORD_DISPATCH)
+        mhRecordDispatch = DxgiBindings.vtableMethod(cmdRecorder,
+                DirectMlBindings.RECORDER_RECORD_DISPATCH,
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS, ValueLayout.ADDRESS));
 
         // Reusable execution binding table (bindings never change between calls)
         long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
@@ -289,8 +384,21 @@ public final class MatMulNBitsKernel implements AutoCloseable {
             DirectMlBindings.bindPersistentResource(execBindingTable, bd);
         }
 
-        log.debug("Execution infrastructure pre-allocated (upload={}, readback={}, fence, cmdList, bindingTable)",
-                inputBytes, outputBytes);
+        log.debug("Execution infrastructure pre-allocated (upload={}, readback={}, " +
+                  "fence, cmdList, bindingTable, barriers, {} cached MethodHandles)",
+                inputBytes, outputBytes, 10);
+    }
+
+    /** Allocate a reusable transition barrier struct in the kernel's arena. */
+    private MemorySegment allocTransitionBarrier(MemorySegment resource, int before, int after) {
+        MemorySegment b = arena.allocate(32, 8);
+        b.set(ValueLayout.JAVA_INT, 0, D3D12Bindings.D3D12_RESOURCE_BARRIER_TYPE_TRANSITION);
+        b.set(ValueLayout.JAVA_INT, 4, D3D12Bindings.D3D12_RESOURCE_BARRIER_FLAG_NONE);
+        b.set(ValueLayout.ADDRESS, 8, resource);
+        b.set(ValueLayout.JAVA_INT, 16, D3D12Bindings.D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        b.set(ValueLayout.JAVA_INT, 20, before);
+        b.set(ValueLayout.JAVA_INT, 24, after);
+        return b;
     }
 
     private void initializeOperator(MemorySegment dev, MemorySegment queue,
@@ -365,11 +473,12 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     /**
      * Compute y = x @ W^T on GPU, writing result into a caller-provided buffer.
      * <p>
-     * <b>V1.1 optimized hot path</b>: upload, DML dispatch, and readback are
+     * <b>V1.2 zero-alloc hot path</b>: upload, DML dispatch, and readback are
      * combined into a <b>single command list submission</b>. All resources
-     * (staging buffers, command allocator, command list, fence, binding table)
-     * are pre-allocated and reused across calls. Only one GPU synchronization
-     * point per call.
+     * (staging buffers, command allocator, command list, fence, binding table,
+     * barrier structs, and MethodHandles) are pre-allocated and reused across
+     * calls. <b>Zero heap allocation, zero MethodHandle creation</b> in the
+     * hot path. Only one GPU synchronization point per call.
      *
      * @param x   input vector [K]
      * @param out output vector [N] (must have length ≥ N)
@@ -379,47 +488,43 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         if (x.length != K) throw new IllegalArgumentException(
                 "Input length " + x.length + " != K=" + K);
 
-        var dev = wb.getD3d12Device();
-        var queue = wb.getCommandQueue();
+        long inputBytes  = (long) K * Float.BYTES;
+        long outputBytes = (long) N * Float.BYTES;
 
-        try (var callArena = Arena.ofConfined()) {
-            long inputBytes  = (long) K * Float.BYTES;
-            long outputBytes = (long) N * Float.BYTES;
-
+        try {
             // 1. Write input to persistently-mapped upload buffer
             MemorySegment.copy(x, 0, mappedUpload, ValueLayout.JAVA_FLOAT, 0, K);
 
-            // 2. Reset and record combined command list
-            D3D12Bindings.resetCommandAllocator(execAllocator);
-            D3D12Bindings.resetCommandList(execCmdList, execAllocator);
+            // 2. Reset allocator + command list (pre-cached MethodHandles)
+            int hr = (int) mhResetAllocator.invokeExact(execAllocator);
+            HResult.check(hr, "CommandAllocator::Reset");
+            hr = (int) mhResetCmdList.invokeExact(execCmdList, execAllocator, MemorySegment.NULL);
+            HResult.check(hr, "CommandList::Reset");
 
-            D3D12Bindings.copyBufferRegion(execCmdList, inputBuf, 0, uploadBuf, 0, inputBytes);
-            D3D12Bindings.transitionBarrier(execCmdList, inputBuf,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS, callArena);
-            D3D12Bindings.setDescriptorHeaps(execCmdList, descriptorHeap, callArena);
-            DirectMlBindings.recordDispatch(cmdRecorder, execCmdList, compiledGemm, execBindingTable);
-            D3D12Bindings.uavBarrier(execCmdList, callArena);
-            D3D12Bindings.transitionBarrier(execCmdList, outputBuf,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE, callArena);
-            D3D12Bindings.copyBufferRegion(execCmdList, readbackBuf, 0, outputBuf, 0, outputBytes);
-            D3D12Bindings.transitionBarrier(execCmdList, inputBuf,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_COMMON, callArena);
-            D3D12Bindings.transitionBarrier(execCmdList, outputBuf,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12Bindings.D3D12_RESOURCE_STATE_COMMON, callArena);
+            // 3. Record: upload → barrier → dispatch → barrier → readback
+            //    All using pre-cached MethodHandles and pre-allocated barriers
+            mhCopyBufferRegion.invokeExact(execCmdList, inputBuf, 0L, uploadBuf, 0L, inputBytes);
+            mhResourceBarrier.invokeExact(execCmdList, 1, barrierInputToUAV);
+            mhSetDescriptorHeaps.invokeExact(execCmdList, 1, heapArrayPtr);
+            mhRecordDispatch.invokeExact(cmdRecorder, execCmdList, compiledGemm, execBindingTable);
+            mhResourceBarrier.invokeExact(execCmdList, 1, barrierUAV);
+            mhResourceBarrier.invokeExact(execCmdList, 1, barrierOutputToCS);
+            mhCopyBufferRegion.invokeExact(execCmdList, readbackBuf, 0L, outputBuf, 0L, outputBytes);
+            mhResourceBarrier.invokeExact(execCmdList, 1, barrierInputToCommon);
+            mhResourceBarrier.invokeExact(execCmdList, 1, barrierOutputToCommon);
 
-            // 3. Execute SINGLE combined command list + wait
-            D3D12Bindings.closeCommandList(execCmdList);
-            D3D12Bindings.executeCommandLists(queue, execCmdList, callArena);
+            // 4. Close + Execute SINGLE combined command list + fence signal
+            hr = (int) mhCloseCmdList.invokeExact(execCmdList);
+            HResult.check(hr, "CommandList::Close");
+            mhExecuteCmdLists.invokeExact(wb.getCommandQueue(), 1, cmdListArrayPtr);
 
             fenceValue++;
-            D3D12Bindings.queueSignal(queue, execFence, fenceValue);
+            hr = (int) mhQueueSignal.invokeExact(wb.getCommandQueue(), execFence, fenceValue);
+            HResult.check(hr, "Queue::Signal");
 
+            // 5. Spin-wait for GPU completion (pre-cached fence MethodHandle)
             long deadline = System.currentTimeMillis() + 10_000;
-            while (D3D12Bindings.fenceGetCompletedValue(execFence) < fenceValue) {
+            while ((long) mhFenceGetCompleted.invokeExact(execFence) < fenceValue) {
                 if (System.currentTimeMillis() > deadline) {
                     throw new WindowsNativeException(
                             "GPU fence timeout after 10000 ms – the GPU may be hung");
@@ -427,11 +532,13 @@ public final class MatMulNBitsKernel implements AutoCloseable {
                 Thread.onSpinWait();
             }
 
-            // 4. Read result from persistently-mapped readback buffer
+            // 6. Read result from persistently-mapped readback buffer
             MemorySegment.copy(mappedReadback, ValueLayout.JAVA_FLOAT, 0, out, 0, N);
 
         } catch (WindowsNativeException e) {
             throw new RuntimeException("MatMulNBitsKernel.matvec failed", e);
+        } catch (Throwable t) {
+            throw new RuntimeException("MatMulNBitsKernel.matvec failed", t);
         }
     }
 

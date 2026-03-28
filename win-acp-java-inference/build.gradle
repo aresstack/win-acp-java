@@ -23,3 +23,11 @@ tasks.withType(Test).configureEach {
     jvmArgs '--enable-native-access=ALL-UNNAMED'
     maxHeapSize = '4g'
 }
+
+// Task to run Phi3ChatCLI for interactive testing / performance measurement
+tasks.register('runCli', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.aresstack.winacp.inference.Phi3ChatCLI'
+    jvmArgs '--enable-native-access=ALL-UNNAMED', '--enable-preview', '-Xmx4g'
+    standardInput = System.in
+}
