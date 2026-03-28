@@ -43,7 +43,7 @@ public final class WindowsBindings implements AutoCloseable {
     private boolean closed = false;
 
     public WindowsBindings() {
-        this.arena = Arena.ofConfined();
+        this.arena = Arena.ofShared();
     }
 
     /**

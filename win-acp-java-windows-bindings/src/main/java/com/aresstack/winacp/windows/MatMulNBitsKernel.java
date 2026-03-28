@@ -74,7 +74,7 @@ public final class MatMulNBitsKernel implements AutoCloseable {
                               byte[] qWeight, float[] scales, byte[] zeroPoints,
                               int blockSize) {
         this.wb = wb;
-        this.arena = Arena.ofConfined();
+        this.arena = Arena.ofShared();
         this.N = N;
         this.K = K;
 
