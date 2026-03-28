@@ -441,6 +441,7 @@ public final class Phi3Runtime {
             float[] result = gpuKernels.lmHead().matvec(x);
             System.arraycopy(result, 0, logits, 0, result.length);
         } else {
+            Arrays.fill(logits, 0);  // zero before matvec (accumulates via +=)
             weights.lmHead.matvec(x, logits);
         }
     }
@@ -489,7 +490,12 @@ public final class Phi3Runtime {
         profCpuNormNs += System.nanoTime() - t0;
 
         // ── Q/K/V Projections (all read from decOProj = normed) ──────
+        // IMPORTANT: QuantizedWeight.matvec() ACCUMULATES (y[n] += sum),
+        // so output buffers must be zeroed before each call.
         t0 = System.nanoTime();
+        Arrays.fill(decQ, 0);
+        Arrays.fill(decK, 0);
+        Arrays.fill(decV, 0);
         if (gpuLayer) {
             float[] qRes = gpuKernels.qProj(layerIdx).matvec(decOProj);
             System.arraycopy(qRes, 0, decQ, 0, hidden);
@@ -579,6 +585,7 @@ public final class Phi3Runtime {
         profCpuNormNs += System.nanoTime() - t0;
 
         t0 = System.nanoTime();
+        Arrays.fill(decOProj, 0);  // zero before matvec (accumulates via +=)
         if (gpuLayer) {
             float[] oRes = gpuKernels.oProj(layerIdx).matvec(decAttnOut);
             System.arraycopy(oRes, 0, decOProj, 0, hidden);
@@ -600,6 +607,7 @@ public final class Phi3Runtime {
 
         // ── MLP: gate_up_proj → decGateUp ────────────────────────────
         t0 = System.nanoTime();
+        Arrays.fill(decGateUp, 0);  // zero before matvec (accumulates via +=)
         if (gpuLayer) {
             float[] guRes = gpuKernels.gateUpProj(layerIdx).matvec(decPostNorm);
             System.arraycopy(guRes, 0, decGateUp, 0, guRes.length);
@@ -627,6 +635,7 @@ public final class Phi3Runtime {
         profCpuNormNs += System.nanoTime() - t0;
 
         t0 = System.nanoTime();
+        Arrays.fill(decDown, 0);  // zero before matvec (accumulates via +=)
         if (gpuLayer) {
             float[] dRes = gpuKernels.downProj(layerIdx).matvec(decMlpAct);
             System.arraycopy(dRes, 0, decDown, 0, hidden);
