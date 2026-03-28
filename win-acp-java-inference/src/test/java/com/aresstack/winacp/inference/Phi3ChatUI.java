@@ -8,18 +8,25 @@ import com.aresstack.winacp.inference.phi3.Phi3Weights;
 import com.aresstack.winacp.windows.WindowsBindings;
 
 import javax.swing.*;
-import javax.swing.text.*;
+import javax.swing.text.View;
 import java.awt.*;
 import java.awt.event.ActionEvent;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.awt.event.KeyEvent;
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Simple Swing chat UI for testing the Phi-3 model interactively.
+ * Structured Swing chat UI for testing the Phi-3 model interactively.
+ * <p>
+ * Uses per-message colored panels with HTML rendering (inspired by
+ * <a href="https://github.com/Miguel0888/MainframeMate">MainframeMate</a>'s
+ * {@code ChatFormatter} / {@code RightDrawer} chat tab).
  * <p>
  * Start this class directly from IntelliJ (right-click → Run).
  * <p>
@@ -35,20 +42,16 @@ import java.time.format.DateTimeFormatter;
 public class Phi3ChatUI {
 
     // ── Model path ───────────────────────────────────────────────────────
-    // Adjust if your model is in a different location.
     private static final Path MODEL_DIR = resolveModelDir();
 
     private static Path resolveModelDir() {
-        // Try relative to working directory (project root)
         Path rel = Path.of("model/phi3-mini-directml-int4/directml/directml-int4-awq-block-128");
         if (Files.exists(rel.resolve("model.onnx"))) return rel;
 
-        // Try relative to submodule (when CWD = win-acp-java-inference)
         Path parent = Path.of(System.getProperty("user.dir")).getParent()
                 .resolve("model/phi3-mini-directml-int4/directml/directml-int4-awq-block-128");
         if (Files.exists(parent.resolve("model.onnx"))) return parent;
 
-        // Fallback
         return rel;
     }
 
@@ -64,18 +67,38 @@ public class Phi3ChatUI {
 
     // ── UI components ────────────────────────────────────────────────────
     private JFrame frame;
-    private JTextPane chatPane;
-    private StyledDocument chatDoc;
+    private JPanel messageContainer;
+    private JScrollPane chatScroll;
     private JTextField inputField;
     private JButton sendButton;
     private JLabel statusLabel;
     private JSpinner maxTokensSpinner;
 
-    // ── Styles ───────────────────────────────────────────────────────────
-    private Style styleUser;
-    private Style styleBot;
-    private Style styleSystem;
-    private Style styleTime;
+    // ── Streaming state ──────────────────────────────────────────────────
+    private JTextPane currentBotTextPane;
+    private JPanel currentBotPanel;
+    private final StringBuilder botBuffer = new StringBuilder();
+
+    // ── Dynamic sizing ───────────────────────────────────────────────────
+    private final List<JTextPane> allTextPanes = new ArrayList<>();
+
+    // ── Roles ────────────────────────────────────────────────────────────
+    enum Role {
+        USER("\uD83D\uDC64 Du", "#e6f0ff", new Color(0x3366AA)),
+        BOT("\uD83E\uDD16 Phi-3", "#f0ffe6", new Color(0x66AA66)),
+        SYSTEM("\u2699 System", "#f0f0f0", new Color(0xAAAAAA)),
+        STATS("\uD83D\uDCCA Stats", "#fff8e6", new Color(0xCCA030));
+
+        final String label;
+        final String bgHex;
+        final Color accentColor;
+
+        Role(String label, String bgHex, Color accentColor) {
+            this.label = label;
+            this.bgHex = bgHex;
+            this.accentColor = accentColor;
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════════════
 
@@ -85,21 +108,21 @@ public class Phi3ChatUI {
 
     private void createAndShow() {
         // ── Frame ────────────────────────────────────────────────────
-        frame = new JFrame("Phi-3 Chat – win-acp-java");
+        frame = new JFrame("Phi-3 Chat \u2013 win-acp-java");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        frame.setSize(720, 600);
+        frame.setSize(780, 650);
         frame.setLocationRelativeTo(null);
 
-        // ── Chat area ────────────────────────────────────────────────
-        chatPane = new JTextPane();
-        chatPane.setEditable(false);
-        chatPane.setFont(new Font("Segoe UI", Font.PLAIN, 14));
-        chatDoc = chatPane.getStyledDocument();
+        // ── Chat area (scrollable panel of message cards) ────────────
+        messageContainer = new JPanel();
+        messageContainer.setLayout(new BoxLayout(messageContainer, BoxLayout.Y_AXIS));
+        messageContainer.setBackground(UIManager.getColor("Panel.background"));
+        messageContainer.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
 
-        initStyles();
-
-        JScrollPane scroll = new JScrollPane(chatPane);
-        scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
+        chatScroll = new JScrollPane(messageContainer);
+        chatScroll.setBorder(BorderFactory.createEmptyBorder());
+        chatScroll.getVerticalScrollBar().setUnitIncrement(16);
+        chatScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS);
 
         // ── Input bar ────────────────────────────────────────────────
         inputField = new JTextField();
@@ -126,14 +149,14 @@ public class Phi3ChatUI {
         inputBar.add(rightPanel, BorderLayout.EAST);
 
         // ── Status bar ───────────────────────────────────────────────
-        statusLabel = new JLabel("  Modell wird geladen...");
+        statusLabel = new JLabel("  Modell wird geladen\u2026");
         statusLabel.setFont(new Font("Segoe UI", Font.ITALIC, 12));
         statusLabel.setForeground(Color.GRAY);
         statusLabel.setBorder(BorderFactory.createEmptyBorder(2, 8, 4, 8));
 
         // ── Layout ───────────────────────────────────────────────────
         JPanel mainPanel = new JPanel(new BorderLayout());
-        mainPanel.add(scroll, BorderLayout.CENTER);
+        mainPanel.add(chatScroll, BorderLayout.CENTER);
         mainPanel.add(inputBar, BorderLayout.SOUTH);
         mainPanel.add(statusLabel, BorderLayout.NORTH);
 
@@ -144,16 +167,20 @@ public class Phi3ChatUI {
         sendButton.addActionListener(e -> sendAction.run());
         inputField.addActionListener(e -> sendAction.run());
 
-        // Ctrl+Enter also sends
         inputField.getInputMap().put(
                 KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, KeyEvent.CTRL_DOWN_MASK), "send");
         inputField.getActionMap().put("send", new AbstractAction() {
             @Override public void actionPerformed(ActionEvent e) { sendAction.run(); }
         });
 
+        // ── Resize listener for dynamic text pane sizing ─────────────
+        frame.addComponentListener(new ComponentAdapter() {
+            @Override public void componentResized(ComponentEvent e) { resizeAllTextPanes(); }
+        });
+
         frame.setVisible(true);
 
-        // ── Cleanup GPU on close ──────────────────────────────────────
+        // ── Cleanup GPU on close ─────────────────────────────────────
         frame.addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
             public void windowClosing(java.awt.event.WindowEvent e) {
@@ -176,7 +203,7 @@ public class Phi3ChatUI {
         try {
             if (!Phi3InferenceEngine.isValidModelDir(MODEL_DIR)) {
                 SwingUtilities.invokeLater(() -> {
-                    appendSystem("❌ Modell nicht gefunden in: " + MODEL_DIR.toAbsolutePath());
+                    appendSystem("\u274C Modell nicht gefunden in: " + MODEL_DIR.toAbsolutePath());
                     appendSystem("Bitte stelle sicher, dass config.json, tokenizer.json, "
                             + "model.onnx und model.onnx.data vorhanden sind.");
                     statusLabel.setText("  Modell nicht gefunden");
@@ -188,7 +215,7 @@ public class Phi3ChatUI {
             tokenizer = Phi3Tokenizer.load(MODEL_DIR.resolve("tokenizer.json"));
             weights = Phi3Weights.load(MODEL_DIR, config);
 
-            // ── Try GPU acceleration ──────────────────────────────────
+            // ── Try GPU acceleration ─────────────────────────────────
             String mode = "CPU";
             try {
                 if (WindowsBindings.isSupported()) {
@@ -208,7 +235,6 @@ public class Phi3ChatUI {
             } catch (Exception gpuEx) {
                 System.err.println("GPU init failed, falling back to CPU: " + gpuEx.getMessage());
                 gpuEx.printStackTrace();
-                // Clean up partial GPU init
                 if (gpuKernels != null) { try { gpuKernels.close(); } catch (Exception ignored) {} gpuKernels = null; }
                 if (wb != null) { try { wb.close(); } catch (Exception ignored) {} wb = null; }
             }
@@ -220,20 +246,20 @@ public class Phi3ChatUI {
 
             final String modeLabel = mode;
             SwingUtilities.invokeLater(() -> {
-                appendSystem(String.format("✅ Modell geladen in %.1f s  (hidden=%d, layers=%d, vocab=%d)",
+                appendSystem(String.format("\u2705 Modell geladen in %.1f s  (hidden=%d, layers=%d, vocab=%d)",
                         elapsed / 1000.0, config.hiddenSize(),
                         config.numHiddenLayers(), config.vocabSize()));
-                appendSystem(modeLabel + "-Modus aktiv. Tippe eine Nachricht und drücke Enter.");
-                appendSystem("─".repeat(60));
+                appendSystem(modeLabel + "-Modus aktiv. Tippe eine Nachricht und dr\u00FCcke Enter.");
+                appendDivider();
                 inputField.setEnabled(true);
                 sendButton.setEnabled(true);
                 inputField.requestFocusInWindow();
-                statusLabel.setText("  Bereit – " + modeLabel);
+                statusLabel.setText("  Bereit \u2013 " + modeLabel);
             });
 
         } catch (Exception e) {
             SwingUtilities.invokeLater(() -> {
-                appendSystem("❌ Fehler beim Laden: " + e.getMessage());
+                appendSystem("\u274C Fehler beim Laden: " + e.getMessage());
                 statusLabel.setText("  Fehler beim Laden");
             });
             e.printStackTrace();
@@ -258,41 +284,35 @@ public class Phi3ChatUI {
         appendUser(userText);
 
         int maxTokens = (int) maxTokensSpinner.getValue();
-        statusLabel.setText("  Generiere...");
+        statusLabel.setText("  Generiere\u2026");
 
         new Thread(() -> {
             try {
                 String prompt = tokenizer.formatChat(null, userText);
                 runtime.resetCache();
 
-                // Insert bot response header
-                SwingUtilities.invokeLater(() ->
-                        append(timestamp() + " Phi-3:\n", styleTime));
+                // Start bot message (streaming)
+                SwingUtilities.invokeLater(this::startBotMessage);
 
                 long t0 = System.currentTimeMillis();
                 final int[] tokenCount = {0};
 
-                // Stream tokens directly into the chat pane
+                // Stream tokens into the bot message panel
                 String response = runtime.generateStreaming(prompt, maxTokens,
                         (tokenId, textSoFar, delta) -> {
                             tokenCount[0]++;
-                            SwingUtilities.invokeLater(() -> {
-                                try {
-                                    chatDoc.insertString(chatDoc.getLength(), delta, styleBot);
-                                    chatPane.setCaretPosition(chatDoc.getLength());
-                                } catch (BadLocationException ignored) {}
-                            });
+                            SwingUtilities.invokeLater(() -> appendBotChunk(delta));
                         });
 
                 long elapsed = System.currentTimeMillis() - t0;
-                String stats = String.format("[%d tokens, %.1f s, %.1f ms/token]",
+                String stats = String.format("%d tokens, %.1f s, %.1f ms/token",
                         tokenCount[0], elapsed / 1000.0,
                         tokenCount[0] > 0 ? (double) elapsed / tokenCount[0] : 0);
 
                 SwingUtilities.invokeLater(() -> {
-                    append("\n\n", styleBot);
-                    appendSystem(stats);
-                    statusLabel.setText("  Bereit – " + stats);
+                    endBotMessage();
+                    appendStats(stats);
+                    statusLabel.setText("  Bereit \u2013 " + stats);
                     inputField.setEnabled(true);
                     sendButton.setEnabled(true);
                     generating = false;
@@ -301,7 +321,8 @@ public class Phi3ChatUI {
 
             } catch (Exception e) {
                 SwingUtilities.invokeLater(() -> {
-                    appendSystem("❌ Fehler: " + e.getMessage());
+                    endBotMessage();
+                    appendSystem("\u274C Fehler: " + e.getMessage());
                     statusLabel.setText("  Fehler bei Generierung");
                     inputField.setEnabled(true);
                     sendButton.setEnabled(true);
@@ -313,58 +334,212 @@ public class Phi3ChatUI {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Chat append helpers
+    // Message panel construction (ChatFormatter-style)
     // ══════════════════════════════════════════════════════════════════════
 
     private void appendUser(String text) {
-        append(timestamp() + " Du:\n", styleTime);
-        append(text + "\n\n", styleUser);
-    }
-
-    private void appendBot(String text) {
-        append(timestamp() + " Phi-3:\n", styleTime);
-        append(text + "\n\n", styleBot);
+        addMessagePanel(Role.USER, escapeHtml(text).replace("\n", "<br/>"));
     }
 
     private void appendSystem(String text) {
-        append(text + "\n", styleSystem);
+        addMessagePanel(Role.SYSTEM, escapeHtml(text).replace("\n", "<br/>"));
     }
 
-    private void append(String text, Style style) {
-        try {
-            chatDoc.insertString(chatDoc.getLength(), text, style);
-            chatPane.setCaretPosition(chatDoc.getLength());
-        } catch (BadLocationException ignored) {}
+    private void appendStats(String text) {
+        addMessagePanel(Role.STATS, escapeHtml(text));
+    }
+
+    /** Insert an HTML horizontal rule as a visual divider between message groups. */
+    private void appendDivider() {
+        JPanel divider = new JPanel();
+        divider.setMaximumSize(new Dimension(Integer.MAX_VALUE, 2));
+        divider.setPreferredSize(new Dimension(100, 2));
+        divider.setBackground(new Color(0xCCCCCC));
+        divider.setAlignmentX(Component.LEFT_ALIGNMENT);
+        messageContainer.add(Box.createVerticalStrut(4));
+        messageContainer.add(divider);
+        messageContainer.add(Box.createVerticalStrut(4));
+        scrollToBottom();
+    }
+
+    // ── Streaming bot message ────────────────────────────────────────────
+
+    private void startBotMessage() {
+        botBuffer.setLength(0);
+        currentBotTextPane = createTextPane();
+        currentBotPanel = createPanelWrapper(Role.BOT);
+
+        JPanel header = createHeader(Role.BOT);
+        currentBotPanel.add(header);
+        currentBotPanel.add(Box.createVerticalStrut(4));
+        currentBotTextPane.setAlignmentX(Component.LEFT_ALIGNMENT);
+        currentBotPanel.add(currentBotTextPane);
+
+        messageContainer.add(currentBotPanel);
+        messageContainer.add(Box.createVerticalStrut(6));
+        scrollToBottom();
+    }
+
+    private void appendBotChunk(String chunk) {
+        if (chunk == null || chunk.isEmpty() || currentBotTextPane == null) return;
+        botBuffer.append(chunk);
+        String html = wrapHtml(escapeHtml(botBuffer.toString()).replace("\n", "<br/>"));
+        currentBotTextPane.setText(html);
+        applyDynamicSizing(currentBotTextPane);
+        scrollToBottom();
+    }
+
+    private void endBotMessage() {
+        if (currentBotTextPane != null) {
+            applyDynamicSizing(currentBotTextPane);
+        }
+        currentBotTextPane = null;
+        currentBotPanel = null;
+    }
+
+    // ── Generic message panel builder ────────────────────────────────────
+
+    private void addMessagePanel(Role role, String htmlBody) {
+        JTextPane pane = createTextPane();
+        pane.setText(wrapHtml(htmlBody));
+        applyDynamicSizing(pane);
+
+        JPanel wrapper = createPanelWrapper(role);
+        JPanel header = createHeader(role);
+        wrapper.add(header);
+        wrapper.add(Box.createVerticalStrut(4));
+        pane.setAlignmentX(Component.LEFT_ALIGNMENT);
+        wrapper.add(pane);
+
+        messageContainer.add(wrapper);
+        messageContainer.add(Box.createVerticalStrut(6));
+        scrollToBottom();
+    }
+
+    private JPanel createPanelWrapper(Role role) {
+        JPanel wrapper = new JPanel();
+        wrapper.setLayout(new BoxLayout(wrapper, BoxLayout.Y_AXIS));
+        wrapper.setBackground(Color.decode(role.bgHex));
+        wrapper.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 4, 0, 0, role.accentColor),
+                BorderFactory.createEmptyBorder(6, 10, 6, 10)
+        ));
+        wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
+        // Constrain width so panels don't get arbitrarily tall
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+        return wrapper;
+    }
+
+    private JPanel createHeader(Role role) {
+        JPanel header = new JPanel();
+        header.setLayout(new BoxLayout(header, BoxLayout.X_AXIS));
+        header.setAlignmentX(Component.LEFT_ALIGNMENT);
+        header.setOpaque(false);
+
+        JLabel titleLabel = new JLabel(role.label);
+        titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        titleLabel.setForeground(role.accentColor.darker());
+        header.add(titleLabel);
+        header.add(Box.createHorizontalGlue());
+
+        JLabel timeLabel = new JLabel(timestamp());
+        timeLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        timeLabel.setForeground(new Color(0x999999));
+        header.add(timeLabel);
+
+        return header;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // HTML text pane helpers
+    // ══════════════════════════════════════════════════════════════════════
+
+    private JTextPane createTextPane() {
+        JTextPane pane = new JTextPane();
+        pane.setContentType("text/html");
+        pane.setEditable(false);
+        pane.setOpaque(false);
+        pane.setBorder(null);
+        pane.setAlignmentX(Component.LEFT_ALIGNMENT);
+        allTextPanes.add(pane);
+        return pane;
+    }
+
+    private String wrapHtml(String bodyHtml) {
+        String css =
+                "body { font-family: 'Segoe UI', sans-serif; font-size: 14px; " +
+                "       margin: 0; padding: 0; line-height: 1.5; } " +
+                "p { margin: 2px 0; } " +
+                "code { background-color: #f5f5f5; padding: 1px 4px; border-radius: 3px; " +
+                "       font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 13px; } " +
+                "pre { background-color: #f5f5f5; padding: 6px; border-radius: 4px; " +
+                "      border: 1px solid #ddd; font-family: monospace; " +
+                "      white-space: pre-wrap; word-wrap: break-word; } " +
+                "hr { border: none; border-top: 1px solid #ccc; margin: 6px 0; } " +
+                "strong { font-weight: bold; } " +
+                "em { font-style: italic; }";
+
+        return "<html><head><style>" + css + "</style></head><body>" + bodyHtml + "</body></html>";
+    }
+
+    private void applyDynamicSizing(JTextPane pane) {
+        int width = (messageContainer.getParent() != null)
+                ? messageContainer.getParent().getWidth() - 60
+                : 600;
+        if (width < 200) width = 600;
+
+        pane.setSize(new Dimension(width, Integer.MAX_VALUE));
+        View rootView = pane.getUI().getRootView(pane);
+        rootView.setSize(width, Integer.MAX_VALUE);
+        int height = (int) rootView.getPreferredSpan(View.Y_AXIS) + 4;
+
+        pane.setPreferredSize(new Dimension(width, height));
+        pane.setMaximumSize(new Dimension(Integer.MAX_VALUE, height));
+        pane.revalidate();
+        pane.repaint();
+    }
+
+    private void resizeAllTextPanes() {
+        SwingUtilities.invokeLater(() -> {
+            int width = (messageContainer.getParent() != null)
+                    ? messageContainer.getParent().getWidth() - 60
+                    : 600;
+            if (width < 200) width = 600;
+
+            for (JTextPane pane : allTextPanes) {
+                pane.setSize(new Dimension(width, Integer.MAX_VALUE));
+                View rootView = pane.getUI().getRootView(pane);
+                rootView.setSize(width, Integer.MAX_VALUE);
+                int height = (int) rootView.getPreferredSpan(View.Y_AXIS) + 4;
+                pane.setPreferredSize(new Dimension(width, height));
+                pane.setMaximumSize(new Dimension(Integer.MAX_VALUE, height));
+                pane.revalidate();
+            }
+            messageContainer.revalidate();
+            messageContainer.repaint();
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Utility
+    // ══════════════════════════════════════════════════════════════════════
+
+    private String escapeHtml(String input) {
+        if (input == null) return "";
+        return input
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;");
+    }
+
+    private void scrollToBottom() {
+        SwingUtilities.invokeLater(() -> {
+            JScrollBar vBar = chatScroll.getVerticalScrollBar();
+            vBar.setValue(vBar.getMaximum());
+        });
     }
 
     private String timestamp() {
         return LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Styles
-    // ══════════════════════════════════════════════════════════════════════
-
-    private void initStyles() {
-        Style def = StyleContext.getDefaultStyleContext().getStyle(StyleContext.DEFAULT_STYLE);
-
-        styleUser = chatDoc.addStyle("user", def);
-        StyleConstants.setForeground(styleUser, new Color(0, 90, 180));
-        StyleConstants.setBold(styleUser, false);
-
-        styleBot = chatDoc.addStyle("bot", def);
-        StyleConstants.setForeground(styleBot, new Color(30, 30, 30));
-        StyleConstants.setBold(styleBot, false);
-
-        styleSystem = chatDoc.addStyle("system", def);
-        StyleConstants.setForeground(styleSystem, new Color(120, 120, 120));
-        StyleConstants.setItalic(styleSystem, true);
-        StyleConstants.setFontSize(styleSystem, 12);
-
-        styleTime = chatDoc.addStyle("time", def);
-        StyleConstants.setForeground(styleTime, new Color(100, 100, 100));
-        StyleConstants.setBold(styleTime, true);
-        StyleConstants.setFontSize(styleTime, 12);
-    }
 }
-
