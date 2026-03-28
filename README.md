@@ -26,8 +26,10 @@ and [MCP](https://modelcontextprotocol.io) tool integration via stdio.
 
 The EMNIST+blank model proves the pipeline handles a **second architecture**
 with different layer topology (3 convolutions, batch normalization in the
-classifier head, 11-class output). Dropout layers are absent in the ONNX
-graph (eliminated during PyTorch eval-mode export).
+classifier head, 11-class output). BatchNorm is **supported via inference-mode
+fusion** (folded into FC weights at load time), not as a separate general-purpose
+runtime operator. Dropout layers are absent in the ONNX graph (eliminated
+during PyTorch eval-mode export).
 
 The int8 model is supported via **dequantize-first**: quantized INT8 weights
 are dequantized to float32 at load time, then processed through the same

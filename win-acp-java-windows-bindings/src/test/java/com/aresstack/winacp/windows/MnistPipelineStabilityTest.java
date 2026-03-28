@@ -153,6 +153,27 @@ class MnistPipelineStabilityTest {
         }
     }
 
+    // ── Double-load guard ─────────────────────────────────────────────────
+
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    @EnabledIf("modelExists")
+    void pipeline_doubleLoad_throws() throws Exception {
+        try (WindowsBindings wb = new WindowsBindings()) {
+            wb.init("auto");
+            if (!wb.hasDirectMl()) return;
+
+            try (MnistPipeline pipeline = new MnistPipeline(wb)) {
+                pipeline.loadModel(MODEL_PATH);
+
+                assertThrows(IllegalStateException.class, () -> {
+                    pipeline.loadModel(MODEL_PATH);
+                }, "loadModel() on already-loaded pipeline should throw");
+                System.out.println("Double-load guard: ✓");
+            }
+        }
+    }
+
     @Test
     @EnabledOnOs(OS.WINDOWS)
     void windowsBindings_initAfterClose_throws() throws Exception {

@@ -23,6 +23,10 @@ import java.util.*;
  *       → Flatten → Gemm+Relu(BN folded) → Gemm → Output(1,11)</li>
  * </ul>
  * <p>
+ * BatchNorm is supported via <b>inference-mode fusion</b>: BN parameters (scale, bias, mean, variance)
+ * are folded into the preceding FC layer's weights and bias at load time. This is the correct V1
+ * solution – no separate general-purpose BatchNorm runtime operator is needed.
+ * <p>
  * No ONNX Runtime, no third-party libs. Pure FFM → Windows DLLs.
  */
 public final class MnistPipeline implements AutoCloseable {
@@ -56,8 +60,6 @@ public final class MnistPipeline implements AutoCloseable {
     // EMNIST-only buffers
     private MemorySegment conv3FBuf, conv3BBuf, conv3Out;
     private MemorySegment fc1WBuf, fc1BBuf, fc1Out;
-    private MemorySegment bnWBuf, bnBBuf, bnMBuf, bnVBuf, bnOut;
-    private MemorySegment reluOut; // after BN+ReLU
 
     // ── Compiled DML operators ───────────────────────────────────────────
     private MemorySegment compiledConv1, compiledPool1;
@@ -66,8 +68,6 @@ public final class MnistPipeline implements AutoCloseable {
     // EMNIST-only compiled operators
     private MemorySegment compiledConv3;
     private MemorySegment compiledGemm1;
-    private MemorySegment compiledBatchNorm;
-    private MemorySegment compiledRelu;
     private MemorySegment[] allCompiled;
 
     // ── DML infra ────────────────────────────────────────────────────────
@@ -103,6 +103,7 @@ public final class MnistPipeline implements AutoCloseable {
 
     public void loadModel(Path onnxFile) throws WindowsNativeException, IOException {
         if (closed) throw new IllegalStateException("MnistPipeline already closed");
+        if (loaded) throw new IllegalStateException("MnistPipeline already loaded – close and create a new instance to load a different model");
         log.info("MnistPipeline.loadModel({})", onnxFile);
         OnnxModelReader.OnnxGraph graph = OnnxModelReader.parse(onnxFile);
 
@@ -306,9 +307,10 @@ public final class MnistPipeline implements AutoCloseable {
         if (bnMean == null) bnMean = new float[128];
         if (bnVar == null) bnVar = new float[128];
 
-        // ── Fold BatchNorm into fc1 weights/bias (inference-mode optimization) ──
+        // ── Inference-mode fusion: fold BatchNorm into fc1 weights/bias ──────
+        // BatchNorm is supported via inference-mode fusion, not as a separate
+        // general-purpose runtime operator. This is the correct V1 solution.
         // y = scale/sqrt(var+eps) * x + (bias - scale*mean/sqrt(var+eps))
-        // This eliminates the BatchNorm operator entirely.
         float eps = 1e-5f;
         int channels = fc1Bias.length;  // 128
         int inputDim = fc1Weight.length / channels;  // 6272
@@ -718,15 +720,18 @@ public final class MnistPipeline implements AutoCloseable {
         }
 
         var alloc = D3D12Bindings.createCommandAllocator(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
-        var cmdList = D3D12Bindings.createCommandList(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, arena);
-        D3D12Bindings.setDescriptorHeaps(cmdList, descriptorHeap, arena);
-        DirectMlBindings.recordDispatch(cmdRecorder, cmdList, initializer, bt);
-        D3D12Bindings.executeAndWait(dev, q, cmdList, arena);
-
-        DxgiBindings.release(cmdList);
-        DxgiBindings.release(alloc);
-        DxgiBindings.release(bt);
-        DxgiBindings.release(initializer);
+        MemorySegment cmdList = null;
+        try {
+            cmdList = D3D12Bindings.createCommandList(dev, D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, arena);
+            D3D12Bindings.setDescriptorHeaps(cmdList, descriptorHeap, arena);
+            DirectMlBindings.recordDispatch(cmdRecorder, cmdList, initializer, bt);
+            D3D12Bindings.executeAndWait(dev, q, cmdList, arena);
+        } finally {
+            if (cmdList != null) DxgiBindings.release(cmdList);
+            DxgiBindings.release(alloc);
+            DxgiBindings.release(bt);
+            DxgiBindings.release(initializer);
+        }
         log.info("Operator initialization complete");
     }
 
@@ -1066,76 +1071,6 @@ public final class MnistPipeline implements AutoCloseable {
         return descOff + descCount;
     }
 
-    /**
-     * Dispatch a DML_BATCH_NORMALIZATION operator.
-     * Inputs (in DML struct order): InputTensor, MeanTensor, VarianceTensor, ScaleTensor, BiasTensor.
-     * Outputs: OutputTensor (1 output).
-     */
-    private int dispatchBatchNorm(MemorySegment dml, MemorySegment cmdList,
-                                   MemorySegment compiled, int opIdx,
-                                   MemorySegment inBuf, long inSize,
-                                   MemorySegment meanBuf, long meanSize,
-                                   MemorySegment varBuf, long varSize,
-                                   MemorySegment scaleBuf, long scaleSize,
-                                   MemorySegment biasBuf, long biasSize,
-                                   MemorySegment outBuf, long outSize,
-                                   long cpuBase, long gpuBase, int descOff)
-            throws WindowsNativeException {
-        int descCount = Math.max(descCounts[opIdx], 1);
-
-        MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiled,
-                cpuBase + (long) descOff * descriptorIncrement,
-                gpuBase + (long) descOff * descriptorIncrement, descCount);
-        MemorySegment bt = DirectMlBindings.createBindingTable(dml, btDesc, arena);
-
-        // 5 inputs in DML struct order: input, mean, variance, scale, bias
-        MemorySegment inputs = arena.allocate(16L * 5, 8);
-        setBufferBinding(inputs, 0, inBuf, inSize);
-        setBufferBinding(inputs, 1, meanBuf, meanSize);
-        setBufferBinding(inputs, 2, varBuf, varSize);
-        setBufferBinding(inputs, 3, scaleBuf, scaleSize);
-        setBufferBinding(inputs, 4, biasBuf, biasSize);
-        DirectMlBindings.bindInputs(bt, 5, inputs);
-
-        MemorySegment outputs = arena.allocate(16, 8);
-        setBufferBinding(outputs, 0, outBuf, outSize);
-        DirectMlBindings.bindOutputs(bt, 1, outputs);
-
-        bindTempAndPersist(bt, opIdx);
-        DirectMlBindings.recordDispatch(cmdRecorder, cmdList, compiled, bt);
-        DxgiBindings.release(bt);
-        return descOff + descCount;
-    }
-
-    /**
-     * Dispatch a unary operator (e.g. ReLU, Identity). 1 input, 1 output.
-     */
-    private int dispatchUnary(MemorySegment dml, MemorySegment cmdList,
-                               MemorySegment compiled, int opIdx,
-                               MemorySegment inBuf, long inSize,
-                               MemorySegment outBuf, long outSize,
-                               long cpuBase, long gpuBase, int descOff)
-            throws WindowsNativeException {
-        int descCount = Math.max(descCounts[opIdx], 1);
-
-        MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiled,
-                cpuBase + (long) descOff * descriptorIncrement,
-                gpuBase + (long) descOff * descriptorIncrement, descCount);
-        MemorySegment bt = DirectMlBindings.createBindingTable(dml, btDesc, arena);
-
-        MemorySegment inputs = arena.allocate(16, 8);
-        setBufferBinding(inputs, 0, inBuf, inSize);
-        DirectMlBindings.bindInputs(bt, 1, inputs);
-
-        MemorySegment outputs = arena.allocate(16, 8);
-        setBufferBinding(outputs, 0, outBuf, outSize);
-        DirectMlBindings.bindOutputs(bt, 1, outputs);
-
-        bindTempAndPersist(bt, opIdx);
-        DirectMlBindings.recordDispatch(cmdRecorder, cmdList, compiled, bt);
-        DxgiBindings.release(bt);
-        return descOff + descCount;
-    }
 
     private void bindTempAndPersist(MemorySegment bt, int opIdx) {
         if (tempSizes[opIdx] > 0 && tempBufs[opIdx] != null) {
@@ -1256,68 +1191,6 @@ public final class MnistPipeline implements AutoCloseable {
         return compiled;
     }
 
-    /**
-     * Create and compile a DML Batch Normalization operator (inference mode).
-     * <p>
-     * DML_BATCH_NORMALIZATION_OPERATOR_DESC layout (x64):
-     * InputTensor(8) + MeanTensor(8) + VarianceTensor(8) + ScaleTensor(8) + BiasTensor(8)
-     * + OutputTensor(8) + Spatial(4) + Epsilon(4) + FusedActivation(8) = 64 bytes
-     *
-     * @param fuseRelu if true, fuse a ReLU activation into the batch norm operator
-     */
-    private MemorySegment createAndCompileBatchNorm(int[] shape, int[] outShape, float epsilon,
-                                                     boolean fuseRelu)
-            throws WindowsNativeException {
-        var dml = wb.getDmlDevice();
-        int[] paramShape = new int[]{1, shape[1], 1, 1};
-
-        MemorySegment bn = arena.allocate(64, 8);
-        bn.set(ValueLayout.ADDRESS, 0, td(shape));          // InputTensor
-        bn.set(ValueLayout.ADDRESS, 8, td(paramShape));     // MeanTensor
-        bn.set(ValueLayout.ADDRESS, 16, td(paramShape));    // VarianceTensor
-        bn.set(ValueLayout.ADDRESS, 24, td(paramShape));    // ScaleTensor
-        bn.set(ValueLayout.ADDRESS, 32, td(paramShape));    // BiasTensor
-        bn.set(ValueLayout.ADDRESS, 40, td(outShape));      // OutputTensor
-        bn.set(ValueLayout.JAVA_INT, 48, 1);                // Spatial = TRUE
-        bn.set(ValueLayout.JAVA_FLOAT, 52, epsilon);        // Epsilon
-
-        if (fuseRelu) {
-            MemorySegment reluDesc = arena.allocate(16, 8); // InputTensor=NULL, OutputTensor=NULL (fused)
-            MemorySegment fusedAct = DirectMlBindings.allocOperatorDesc(arena,
-                    DirectMlBindings.DML_OPERATOR_ACTIVATION_RELU, reluDesc);
-            bn.set(ValueLayout.ADDRESS, 56, fusedAct);
-        } else {
-            bn.set(ValueLayout.ADDRESS, 56, MemorySegment.NULL);
-        }
-
-        MemorySegment opDesc = DirectMlBindings.allocOperatorDesc(arena,
-                DirectMlBindings.DML_OPERATOR_BATCH_NORMALIZATION, bn);
-        MemorySegment op = DirectMlBindings.createOperator(dml, opDesc, arena);
-        MemorySegment compiled = DirectMlBindings.compileOperator(dml, op, DirectMlBindings.DML_EXECUTION_FLAG_NONE, arena);
-        DxgiBindings.release(op);
-        return compiled;
-    }
-
-    /**
-     * Create and compile a standalone ReLU (ACTIVATION_RELU) operator.
-     * <p>
-     * DML_ACTIVATION_RELU_OPERATOR_DESC: InputTensor(8) + OutputTensor(8) = 16 bytes
-     */
-    private MemorySegment createAndCompileIdentityRelu(int[] shape)
-            throws WindowsNativeException {
-        var dml = wb.getDmlDevice();
-
-        MemorySegment relu = arena.allocate(16, 8);
-        relu.set(ValueLayout.ADDRESS, 0, td(shape));
-        relu.set(ValueLayout.ADDRESS, 8, td(shape));
-
-        MemorySegment opDesc = DirectMlBindings.allocOperatorDesc(arena,
-                DirectMlBindings.DML_OPERATOR_ACTIVATION_RELU, relu);
-        MemorySegment op = DirectMlBindings.createOperator(dml, opDesc, arena);
-        MemorySegment compiled = DirectMlBindings.compileOperator(dml, op, DirectMlBindings.DML_EXECUTION_FLAG_NONE, arena);
-        DxgiBindings.release(op);
-        return compiled;
-    }
 
     // ══════════════════════════════════════════════════════════════════════
     //  Internal helpers
@@ -1393,8 +1266,7 @@ public final class MnistPipeline implements AutoCloseable {
         }
         // Release EMNIST-only buffers
         for (var buf : new MemorySegment[]{conv3FBuf, conv3BBuf, conv3Out,
-                fc1WBuf, fc1BBuf, fc1Out,
-                bnWBuf, bnBBuf, bnMBuf, bnVBuf, bnOut, reluOut}) {
+                fc1WBuf, fc1BBuf, fc1Out}) {
             safeRelease(buf, "EMNIST GPU buffer");
         }
         if (tempBufs != null) for (var b : tempBufs) safeRelease(b, "temp buffer");
