@@ -40,12 +40,21 @@ public final class Phi3Runtime {
     private final Phi3Config config;
     private final Phi3Weights weights;
     private final Phi3Tokenizer tokenizer;
-    private final Phi3GpuKernels gpuKernels; // nullable — null means CPU-only
+    private final Phi3GpuKernels gpuKernels;
 
-    // KV cache: [layer][2 (k/v)][head][position][headDim]
-    // Stored flat as: [numLayers][2][allocated]
-    private final float[][] kvCache; // [numLayers * 2][allocated]
-    private int cachedSeqLen;        // number of positions in cache
+    private final float[][] kvCache;
+    private int cachedSeqLen;
+
+    // ── Decode profiling (accumulated per generation, reset on each call) ─
+    private long profGpuProjNs;   // GPU Q/K/V/O + gate_up + down projections
+    private long profCpuAttnNs;   // CPU causal self-attention (dot + softmax + weighted sum)
+    private long profCpuNormNs;   // CPU RMSNorm + RoPE + residual + scales
+    private long profCpuActNs;    // CPU SwiGLU activation
+    private long profLmHeadNs;    // LM head (GPU or CPU)
+    private long profTokenDecNs;  // Token decode (tokenizer)
+    private long profPrefillNs;   // Prefill phase
+    private int  profSteps;
+    private String lastProfile;   // formatted profile string from last generation
 
     /**
      * CPU-only constructor (backward compatible).
@@ -105,6 +114,13 @@ public final class Phi3Runtime {
     }
 
     /**
+     * Returns the formatted profile string from the last generation, or null.
+     */
+    public String getLastProfile() {
+        return lastProfile;
+    }
+
+    /**
      * Generate tokens greedily with a per-token streaming callback.
      * <p>
      * Token IDs are accumulated and decoded as a full sequence after each
@@ -116,16 +132,17 @@ public final class Phi3Runtime {
      * @return generated text (excluding the prompt)
      */
     public String generateStreaming(String prompt, int maxTokens, TokenConsumer consumer) {
-        log.info("Encoding prompt ({} chars)", prompt.length());
         int[] inputIds = tokenizer.encode(prompt);
-        log.info("Prompt tokens: {}", inputIds.length);
+        log.info("Prompt: {} chars → {} tokens", prompt.length(), inputIds.length);
 
-        // Reset KV cache
+        // Reset KV cache and profiling
         resetCache();
+        resetProfile();
 
-        // Prefill: process all prompt tokens at once
-        log.info("Prefill: {} tokens", inputIds.length);
+        // Prefill
+        long t0 = System.nanoTime();
         float[] logits = prefill(inputIds);
+        profPrefillNs = System.nanoTime() - t0;
 
         // Accumulate generated token IDs for proper decoding (preserves spaces)
         List<Integer> generatedIds = new ArrayList<>();
@@ -135,36 +152,68 @@ public final class Phi3Runtime {
             int nextToken = argmax(logits);
 
             if (tokenizer.isEos(nextToken)) {
-                log.info("EOS token {} at step {}", nextToken, step);
                 break;
             }
 
             generatedIds.add(nextToken);
 
             // Decode full sequence to preserve SentencePiece spaces
+            long td0 = System.nanoTime();
             String fullText = tokenizer.decode(
                     generatedIds.stream().mapToInt(Integer::intValue).toArray());
             String delta = fullText.substring(previousText.length());
             previousText = fullText;
+            profTokenDecNs += System.nanoTime() - td0;
 
             if (consumer != null) {
                 consumer.onToken(nextToken, fullText, delta);
             }
 
-            if (step < 10 || step % 50 == 0) {
-                log.debug("Step {}: token={} '{}'", step, nextToken, delta.trim());
-            }
-
             // Decode: process single token
             logits = decode(nextToken);
+            profSteps++;
         }
+
+        // Build profile summary
+        lastProfile = buildProfileSummary();
+        System.out.println(lastProfile);
 
         return previousText;
     }
 
-    /**
-     * Reset the KV cache (e.g. for a new conversation).
-     */
+    // ── Profiling ────────────────────────────────────────────────────────
+
+    private void resetProfile() {
+        profGpuProjNs = profCpuAttnNs = profCpuNormNs = profCpuActNs = 0;
+        profLmHeadNs = profTokenDecNs = profPrefillNs = 0;
+        profSteps = 0;
+        lastProfile = null;
+    }
+
+    private String buildProfileSummary() {
+        if (profSteps == 0) return "[No tokens generated]";
+        long totalDecode = profGpuProjNs + profCpuAttnNs + profCpuNormNs + profCpuActNs + profLmHeadNs;
+        double totalMs = totalDecode / 1e6;
+        double perToken = totalMs / profSteps;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("[Decode Profile] %d tokens, %.1f ms total, %.1f ms/token%n", profSteps, totalMs, perToken));
+        sb.append(String.format("  Prefill:         %.1f ms (%d prompt tokens)%n", profPrefillNs / 1e6, cachedSeqLen - profSteps));
+        sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [%d calls/tok × 32 layers]%n",
+                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / totalDecode,
+                gpuKernels != null ? 6 : 0));
+        sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%)%n",
+                profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / totalDecode));
+        sb.append(String.format("  CPU norms+RoPE:  %.1f ms avg (%.0f%%)%n",
+                profCpuNormNs / 1e6 / profSteps, 100.0 * profCpuNormNs / totalDecode));
+        sb.append(String.format("  CPU SwiGLU:      %.1f ms avg (%.0f%%)%n",
+                profCpuActNs / 1e6 / profSteps, 100.0 * profCpuActNs / totalDecode));
+        sb.append(String.format("  LM head:         %.1f ms avg (%.0f%%)%n",
+                profLmHeadNs / 1e6 / profSteps, 100.0 * profLmHeadNs / totalDecode));
+        sb.append(String.format("  Token decode:    %.1f ms avg%n", profTokenDecNs / 1e6 / profSteps));
+        return sb.toString();
+    }
+
     public void resetCache() {
         cachedSeqLen = 0;
         Arrays.fill(kvCache, null);
@@ -183,8 +232,7 @@ public final class Phi3Runtime {
         // Embedding lookup
         float[] hidden_states = new float[seqLen * hidden];
         for (int s = 0; s < seqLen; s++) {
-            int tokenId = tokenIds[s];
-            System.arraycopy(weights.embedTokens, tokenId * hidden, hidden_states, s * hidden, hidden);
+            System.arraycopy(weights.embedTokens, tokenIds[s] * hidden, hidden_states, s * hidden, hidden);
         }
 
         // Process each layer
@@ -219,24 +267,27 @@ public final class Phi3Runtime {
         System.arraycopy(weights.embedTokens, tokenId * hidden, hidden_states, 0, hidden);
 
         // Process each layer (seqLen=1)
-        float[] buf = new float[1 * hidden];
+        float[] buf = new float[hidden];
         System.arraycopy(hidden_states, 0, buf, 0, hidden);
         for (int l = 0; l < config.numHiddenLayers(); l++) {
             buf = processLayer(l, buf, 1, pos);
         }
         System.arraycopy(buf, 0, hidden_states, 0, hidden);
 
-        // Final norm + logits
+        long t0 = System.nanoTime();
         rmsNorm(hidden_states, weights.finalNormWeight, config.rmsNormEps());
+        profCpuNormNs += System.nanoTime() - t0;
 
+        t0 = System.nanoTime();
         float[] logits = new float[weights.lmHead.N()];
         lmHeadMatvec(hidden_states, logits);
+        profLmHeadNs += System.nanoTime() - t0;
 
         cachedSeqLen = pos + 1;
         return logits;
     }
 
-    // ── LM head: GPU or CPU ──────────────────────────────────────────────
+    // ── LM head ──────────────────────────────────────────────────────────
 
     /**
      * Compute logits = x @ lm_head^T, using GPU if available.
@@ -250,7 +301,7 @@ public final class Phi3Runtime {
         }
     }
 
-    // ── Layer processing ─────────────────────────────────────────────────
+    // ── Layer processing (with profiling) ────────────────────────────────
 
     /**
      * Process one decoder layer.
@@ -268,8 +319,10 @@ public final class Phi3Runtime {
         int kvHeads = config.numKeyValueHeads();
         LayerWeights lw = weights.layers[layerIdx];
         boolean gpuLayer = gpuKernels != null && gpuKernels.hasLayer(layerIdx);
+        long t0;
 
         // ── Pre-attention RMSNorm ────────────────────────────────────
+        t0 = System.nanoTime();
         float[] normed = new float[seqLen * hidden];
         for (int s = 0; s < seqLen; s++) {
             float[] row = new float[hidden];
@@ -277,11 +330,13 @@ public final class Phi3Runtime {
             rmsNorm(row, lw.inputNormWeight(), config.rmsNormEps());
             System.arraycopy(row, 0, normed, s * hidden, hidden);
         }
+        profCpuNormNs += System.nanoTime() - t0;
 
         // ── Q/K/V Projections (GPU or CPU) ────────────────────────────
-        float[] q = new float[seqLen * hidden]; // [seqLen, numHeads * headDim]
-        float[] k = new float[seqLen * hidden]; // [seqLen, kvHeads * headDim]
-        float[] v = new float[seqLen * hidden]; // [seqLen, kvHeads * headDim]
+        t0 = System.nanoTime();
+        float[] q = new float[seqLen * hidden];
+        float[] k = new float[seqLen * hidden];
+        float[] v = new float[seqLen * hidden];
 
         if (gpuLayer) {
             gpuMatmul(gpuKernels.qProj(layerIdx), normed, q, seqLen, hidden, hidden);
@@ -292,21 +347,20 @@ public final class Phi3Runtime {
             lw.kProj().matmul(normed, k, seqLen);
             lw.vProj().matmul(normed, v, seqLen);
         }
+        profGpuProjNs += System.nanoTime() - t0;
 
         // ── RoPE ─────────────────────────────────────────────────────
+        t0 = System.nanoTime();
         for (int s = 0; s < seqLen; s++) {
             int pos = startPos + s;
-            // Apply RoPE to all Q heads
             for (int h = 0; h < numHeads; h++) {
-                int off = s * hidden + h * headDim;
-                applyRoPE(q, off, headDim, pos);
+                applyRoPE(q, s * hidden + h * headDim, headDim, pos);
             }
-            // Apply RoPE to all K heads
             for (int h = 0; h < kvHeads; h++) {
-                int off = s * hidden + h * headDim;
-                applyRoPE(k, off, headDim, pos);
+                applyRoPE(k, s * hidden + h * headDim, headDim, pos);
             }
         }
+        profCpuNormNs += System.nanoTime() - t0;
 
         // ── KV Cache update ──────────────────────────────────────────
         int kCacheIdx = layerIdx * 2;
@@ -314,7 +368,6 @@ public final class Phi3Runtime {
         int totalSeq = startPos + seqLen;
         int cacheRowSize = kvHeads * headDim;
 
-        // Ensure cache is allocated
         if (kvCache[kCacheIdx] == null || kvCache[kCacheIdx].length < totalSeq * cacheRowSize) {
             int capacity = Math.max(totalSeq, 64) * cacheRowSize;
             float[] newK = new float[capacity];
@@ -329,7 +382,6 @@ public final class Phi3Runtime {
             kvCache[vCacheIdx] = newV;
         }
 
-        // Write new K/V into cache
         for (int s = 0; s < seqLen; s++) {
             System.arraycopy(k, s * hidden, kvCache[kCacheIdx],
                     (startPos + s) * cacheRowSize, cacheRowSize);
@@ -338,20 +390,16 @@ public final class Phi3Runtime {
         }
 
         // ── Causal Self-Attention ────────────────────────────────────
+        t0 = System.nanoTime();
         float[] attnOut = new float[seqLen * hidden];
         float scale = (float) (1.0 / Math.sqrt(headDim));
 
         for (int s = 0; s < seqLen; s++) {
             int queryPos = startPos + s;
-
             for (int h = 0; h < numHeads; h++) {
-                // Determine which KV head this query head uses
-                int kvH = h % kvHeads; // For Phi-3-mini: kvHeads == numHeads, so kvH == h
-
-                // Q vector for this head
+                int kvH = h % kvHeads;
                 int qOff = s * hidden + h * headDim;
 
-                // Compute attention scores against all cached K positions [0..queryPos]
                 float[] scores = new float[queryPos + 1];
                 for (int p = 0; p <= queryPos; p++) {
                     int kOff = p * cacheRowSize + kvH * headDim;
@@ -362,10 +410,8 @@ public final class Phi3Runtime {
                     scores[p] = dot * scale;
                 }
 
-                // Softmax
                 softmax(scores);
 
-                // Weighted sum of V vectors
                 int outOff = s * hidden + h * headDim;
                 for (int p = 0; p <= queryPos; p++) {
                     int vOff = p * cacheRowSize + kvH * headDim;
@@ -376,22 +422,28 @@ public final class Phi3Runtime {
                 }
             }
         }
+        profCpuAttnNs += System.nanoTime() - t0;
 
         // ── Activation scale + O projection ──────────────────────────
+        t0 = System.nanoTime();
         for (int s = 0; s < seqLen; s++) {
             for (int i = 0; i < hidden; i++) {
                 attnOut[s * hidden + i] *= lw.attnOutScale()[i];
             }
         }
+        profCpuNormNs += System.nanoTime() - t0;
 
+        t0 = System.nanoTime();
         float[] oProjOut = new float[seqLen * hidden];
         if (gpuLayer) {
             gpuMatmul(gpuKernels.oProj(layerIdx), attnOut, oProjOut, seqLen, hidden, hidden);
         } else {
             lw.oProj().matmul(attnOut, oProjOut, seqLen);
         }
+        profGpuProjNs += System.nanoTime() - t0;
 
         // ── Residual connection 1 ────────────────────────────────────
+        t0 = System.nanoTime();
         float[] residual1 = new float[seqLen * hidden];
         for (int i = 0; i < seqLen * hidden; i++) {
             residual1[i] = input[i] + oProjOut[i];
@@ -405,8 +457,10 @@ public final class Phi3Runtime {
             rmsNorm(row, lw.postNormWeight(), config.rmsNormEps());
             System.arraycopy(row, 0, postNormed, s * hidden, hidden);
         }
+        profCpuNormNs += System.nanoTime() - t0;
 
         // ── MLP: gate_up_proj (GPU or CPU) ────────────────────────────
+        t0 = System.nanoTime();
         int intermediateX2 = config.intermediateSize() * 2;
         float[] gateUp = new float[seqLen * intermediateX2];
         if (gpuLayer) {
@@ -415,8 +469,10 @@ public final class Phi3Runtime {
         } else {
             lw.gateUpProj().matmul(postNormed, gateUp, seqLen);
         }
+        profGpuProjNs += System.nanoTime() - t0;
 
         // ── SwiGLU activation ────────────────────────────────────────
+        t0 = System.nanoTime();
         int intermediate = config.intermediateSize();
         float[] mlpActivation = new float[seqLen * intermediate];
         for (int s = 0; s < seqLen; s++) {
@@ -429,14 +485,18 @@ public final class Phi3Runtime {
                 mlpActivation[outOff + i] = up * gate * sigmoid;
             }
         }
+        profCpuActNs += System.nanoTime() - t0;
 
         // ── Activation scale + down_proj (GPU or CPU) ─────────────────
+        t0 = System.nanoTime();
         for (int s = 0; s < seqLen; s++) {
             for (int i = 0; i < intermediate; i++) {
                 mlpActivation[s * intermediate + i] *= lw.mlpOutScale()[i];
             }
         }
+        profCpuNormNs += System.nanoTime() - t0;
 
+        t0 = System.nanoTime();
         float[] downOut = new float[seqLen * hidden];
         if (gpuLayer) {
             gpuMatmul(gpuKernels.downProj(layerIdx), mlpActivation, downOut,
@@ -444,6 +504,7 @@ public final class Phi3Runtime {
         } else {
             lw.downProj().matmul(mlpActivation, downOut, seqLen);
         }
+        profGpuProjNs += System.nanoTime() - t0;
 
         // ── Residual connection 2 ────────────────────────────────────
         float[] output = new float[seqLen * hidden];

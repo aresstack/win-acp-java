@@ -10,6 +10,7 @@ import com.aresstack.winacp.windows.WindowsBindings;
 import javax.swing.*;
 import javax.swing.text.View;
 import java.awt.*;
+import java.awt.datatransfer.StringSelection;
 import java.awt.event.ActionEvent;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
@@ -65,12 +66,20 @@ public class Phi3ChatUI {
     private volatile boolean modelReady = false;
     private volatile boolean generating = false;
 
+    private static final String SYSTEM_PROMPT =
+            "You are a helpful AI assistant. Answer concisely and accurately. " +
+            "Respond in the same language the user writes in.";
+
+    // ── Chat history for clipboard export ────────────────────────────────
+    private final List<String> chatHistory = new ArrayList<>();
+
     // ── UI components ────────────────────────────────────────────────────
     private JFrame frame;
     private JPanel messageContainer;
     private JScrollPane chatScroll;
     private JTextField inputField;
     private JButton sendButton;
+    private JButton copyButton;
     private JLabel statusLabel;
     private JSpinner maxTokensSpinner;
 
@@ -144,6 +153,12 @@ public class Phi3ChatUI {
         rightPanel.add(new JLabel("Max:"));
         rightPanel.add(maxTokensSpinner);
         rightPanel.add(sendButton);
+
+        copyButton = new JButton("\uD83D\uDCCB Copy");
+        copyButton.setPreferredSize(new Dimension(80, 32));
+        copyButton.setToolTipText("Gesamten Chat in die Zwischenablage kopieren");
+        copyButton.addActionListener(e -> copyChat());
+        rightPanel.add(copyButton);
 
         inputBar.add(inputField, BorderLayout.CENTER);
         inputBar.add(rightPanel, BorderLayout.EAST);
@@ -288,7 +303,7 @@ public class Phi3ChatUI {
 
         new Thread(() -> {
             try {
-                String prompt = tokenizer.formatChat(null, userText);
+                String prompt = tokenizer.formatChat(SYSTEM_PROMPT, userText);
                 runtime.resetCache();
 
                 // Start bot message (streaming)
@@ -338,6 +353,7 @@ public class Phi3ChatUI {
     // ══════════════════════════════════════════════════════════════════════
 
     private void appendUser(String text) {
+        chatHistory.add("[" + timestamp() + "] Du: " + text);
         addMessagePanel(Role.USER, escapeHtml(text).replace("\n", "<br/>"));
     }
 
@@ -346,7 +362,11 @@ public class Phi3ChatUI {
     }
 
     private void appendStats(String text) {
-        addMessagePanel(Role.STATS, escapeHtml(text));
+        chatHistory.add(text);
+        // Append profile from runtime if available
+        String profile = runtime != null ? runtime.getLastProfile() : null;
+        String combined = profile != null ? text + "\n" + profile : text;
+        addMessagePanel(Role.STATS, "<pre>" + escapeHtml(combined) + "</pre>");
     }
 
     /** Insert an HTML horizontal rule as a visual divider between message groups. */
@@ -392,6 +412,7 @@ public class Phi3ChatUI {
     private void endBotMessage() {
         if (currentBotTextPane != null) {
             applyDynamicSizing(currentBotTextPane);
+            chatHistory.add("[" + timestamp() + "] Phi-3: " + botBuffer.toString());
         }
         currentBotTextPane = null;
         currentBotPanel = null;
@@ -541,5 +562,24 @@ public class Phi3ChatUI {
 
     private String timestamp() {
         return LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Chat history export
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void copyChat() {
+        if (chatHistory.isEmpty()) return;
+
+        StringBuilder sb = new StringBuilder();
+        for (String entry : chatHistory) {
+            sb.append(entry).append("\n");
+        }
+
+        StringSelection selection = new StringSelection(sb.toString());
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, null);
+
+        JOptionPane.showMessageDialog(frame, "Gesamter Chat in die Zwischenablage kopiert!",
+                "Chat kopieren", JOptionPane.INFORMATION_MESSAGE);
     }
 }
