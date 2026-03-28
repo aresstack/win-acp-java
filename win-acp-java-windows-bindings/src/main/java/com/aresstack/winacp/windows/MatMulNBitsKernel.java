@@ -97,33 +97,66 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         this.K = K;
 
         try {
-            prepare(qWeight, scales, zeroPoints, blockSize);
+            long t0 = System.nanoTime();
+            float[] dequantized = dequantizeInt4(qWeight, scales, zeroPoints, N, K, blockSize);
+            log.info("Dequantized [{}, {}] INT4→FP32 in {} ms",
+                    N, K, (System.nanoTime() - t0) / 1_000_000);
+            prepareGpu(dequantized);
         } catch (WindowsNativeException e) {
             arena.close();
             throw new RuntimeException("MatMulNBitsKernel preparation failed", e);
         }
     }
 
+    /**
+     * Create a kernel from pre-dequantized FP32 weights.
+     * <p>
+     * Used for fused projections (e.g., Q+K+V merged into one larger matrix)
+     * where the caller has already dequantized and concatenated the weights.
+     *
+     * @param wb      initialized WindowsBindings
+     * @param N       output features (rows)
+     * @param K       input features (cols)
+     * @param weights pre-dequantized FP32 weight matrix [N * K], row-major
+     * @return ready-to-use kernel
+     */
+    public static MatMulNBitsKernel fromDequantizedWeights(WindowsBindings wb,
+                                                            int N, int K,
+                                                            float[] weights) {
+        return new MatMulNBitsKernel(wb, N, K, weights);
+    }
+
+    /** Package-private constructor for pre-dequantized FP32 weights. */
+    private MatMulNBitsKernel(WindowsBindings wb, int N, int K, float[] fp32Weights) {
+        this.wb = wb;
+        this.arena = Arena.ofShared();
+        this.N = N;
+        this.K = K;
+
+        try {
+            prepareGpu(fp32Weights);
+        } catch (WindowsNativeException e) {
+            arena.close();
+            throw new RuntimeException("MatMulNBitsKernel preparation failed (FP32 path)", e);
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════
-    // Preparation: dequantize → upload → compile → pre-allocate exec infra
+    // Preparation: upload FP32 weights → compile → pre-allocate exec infra
     // ══════════════════════════════════════════════════════════════════════
 
-    private void prepare(byte[] qWeight, float[] scales, byte[] zeroPoints, int blockSize)
-            throws WindowsNativeException {
+    /**
+     * GPU setup: create buffers, upload weights, compile GEMM, pre-allocate
+     * execution infrastructure.  Called by both constructors.
+     */
+    private void prepareGpu(float[] dequantized) throws WindowsNativeException {
         var dev = wb.getD3d12Device();
         var queue = wb.getCommandQueue();
         var dml = wb.getDmlDevice();
 
-        long t0 = System.nanoTime();
-
-        // ── Step 1: Dequantize INT4 → FP32 on CPU ────────────────────
-        // The dequantized weight matrix is [N, K] in row-major order.
+        // ── Step 1: Create GPU buffers ────────────────────────────────
+        // The weight matrix is [N, K] in row-major order.
         // Each weight = (nibble_value - zero_point) * scale
-        float[] dequantized = dequantizeInt4(qWeight, scales, zeroPoints, N, K, blockSize);
-        log.info("Dequantized [{}, {}] INT4→FP32 in {} ms",
-                N, K, (System.nanoTime() - t0) / 1_000_000);
-
-        // ── Step 2: Create GPU buffers ────────────────────────────────
         long weightBytes = (long) N * K * Float.BYTES;
         long inputBytes  = (long) K * Float.BYTES;        // M=1 for matvec
         long outputBytes = (long) N * Float.BYTES;
@@ -134,21 +167,14 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         inputBuf  = D3D12Bindings.createDefaultBuffer(dev, inputBytes, arena);
         outputBuf = D3D12Bindings.createDefaultBuffer(dev, outputBytes, arena);
 
-        // ── Step 3: Upload weight data to GPU ─────────────────────────
+        // ── Step 2: Upload weight data to GPU ─────────────────────────
         D3D12Bindings.uploadFloats(dev, queue, weightBuf, dequantized, arena);
         float[] zeroBias = new float[N]; // GEMM C tensor = zero bias
         D3D12Bindings.uploadFloats(dev, queue, biasBuf, zeroBias, arena);
         log.info("Uploaded weight [{}, {}] to GPU ({} MB)",
                 N, K, weightBytes / (1024 * 1024));
 
-        // ── Step 4: Create and compile DirectML GEMM operator ─────────
-        // GEMM: Y = alpha * (A @ B^T) + beta * C
-        //   A = input  [1, K]
-        //   B = weight [N, K]  → with transB, this computes A @ B^T = [1, K] @ [K, N] = [1, N]
-        //   C = bias   [1, N]
-        //   Y = output [1, N]
-        // alpha=1.0, beta=1.0 (bias is zero, so effectively Y = A @ B^T)
-
+        // ── Step 3: Create and compile DirectML GEMM operator ─────────
         MemorySegment gemm = arena.allocate(56, 8);
         gemm.set(ValueLayout.ADDRESS,  0, td(new int[]{1, 1, 1, K}));       // A: [1,1,1,K]
         gemm.set(ValueLayout.ADDRESS,  8, td(new int[]{1, 1, N, K}));       // B: [1,1,N,K]
@@ -167,21 +193,21 @@ public final class MatMulNBitsKernel implements AutoCloseable {
                 DirectMlBindings.DML_EXECUTION_FLAG_NONE, arena);
         DxgiBindings.release(op);
 
-        // ── Step 5: Query binding properties ──────────────────────────
+        // ── Step 4: Query binding properties ──────────────────────────
         long[] props = DirectMlBindings.getBindingProperties(compiledGemm, arena);
         descCount   = Math.max((int) props[0], 1);
         tempSize    = props[1];
         persistSize = props[2];
         log.debug("GEMM binding: desc={}, temp={}, persist={}", descCount, tempSize, persistSize);
 
-        // ── Step 6: Create descriptor heap ────────────────────────────
+        // ── Step 5: Create descriptor heap ────────────────────────────
         // Need descriptors for: initialization + execution
-        int totalDesc = descCount * 2 + 4; // extra headroom
+        int totalDesc = descCount * 2 + 4;
         descriptorHeap = D3D12Bindings.createDescriptorHeap(dev, totalDesc, arena);
         descriptorIncrement = D3D12Bindings.getDescriptorIncrementSize(dev);
         cmdRecorder = DirectMlBindings.createCommandRecorder(dml, arena);
 
-        // ── Step 7: Allocate temp/persist buffers ─────────────────────
+        // ── Step 6: Allocate temp/persist buffers ─────────────────────
         if (tempSize > 0) {
             tempBuf = D3D12Bindings.createDefaultBuffer(dev, tempSize, arena);
         }
@@ -189,10 +215,10 @@ public final class MatMulNBitsKernel implements AutoCloseable {
             persistBuf = D3D12Bindings.createDefaultBuffer(dev, persistSize, arena);
         }
 
-        // ── Step 8: Initialize the operator ───────────────────────────
+        // ── Step 7: Initialize the operator ───────────────────────────
         initializeOperator(dev, queue, dml);
 
-        // ── Step 9: Pre-allocate execution infrastructure (V1.1) ──────
+        // ── Step 8: Pre-allocate execution infrastructure (V1.1) ──────
         prepareExecInfra(dev, dml, inputBytes, outputBytes);
 
         prepared = true;
@@ -325,24 +351,30 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Compute y = x @ W^T on GPU.
+     * Compute y = x @ W^T on GPU, returning a freshly allocated result array.
+     *
+     * @param x input vector [K]
+     * @return output vector [N] (freshly allocated)
+     */
+    public float[] matvec(float[] x) {
+        float[] result = new float[N];
+        matvec(x, result);
+        return result;
+    }
+
+    /**
+     * Compute y = x @ W^T on GPU, writing result into a caller-provided buffer.
      * <p>
      * <b>V1.1 optimized hot path</b>: upload, DML dispatch, and readback are
      * combined into a <b>single command list submission</b>. All resources
      * (staging buffers, command allocator, command list, fence, binding table)
      * are pre-allocated and reused across calls. Only one GPU synchronization
      * point per call.
-     * <p>
-     * <b>Previous V1 hot path</b> had 3 separate GPU submissions (upload,
-     * dispatch, readback) with full fence wait each, plus creation and
-     * destruction of command allocators, command lists, binding tables,
-     * staging buffers, and fences on every call. This caused ~750 ms/token
-     * overhead for Phi-3 decode (193 matvec calls × 3 syncs = 579 GPU syncs).
      *
-     * @param x input vector [K]
-     * @return output vector [N]
+     * @param x   input vector [K]
+     * @param out output vector [N] (must have length ≥ N)
      */
-    public float[] matvec(float[] x) {
+    public void matvec(float[] x, float[] out) {
         if (!prepared) throw new IllegalStateException("Kernel not prepared");
         if (x.length != K) throw new IllegalArgumentException(
                 "Input length " + x.length + " != K=" + K);
@@ -354,38 +386,24 @@ public final class MatMulNBitsKernel implements AutoCloseable {
             long inputBytes  = (long) K * Float.BYTES;
             long outputBytes = (long) N * Float.BYTES;
 
-            // 1. Write input to persistently-mapped upload buffer (CPU-side only, no GPU command)
+            // 1. Write input to persistently-mapped upload buffer
             MemorySegment.copy(x, 0, mappedUpload, ValueLayout.JAVA_FLOAT, 0, K);
 
             // 2. Reset and record combined command list
             D3D12Bindings.resetCommandAllocator(execAllocator);
             D3D12Bindings.resetCommandList(execCmdList, execAllocator);
 
-            // 2a. Copy upload buffer → inputBuf (COMMON auto-promotes to COPY_DEST)
             D3D12Bindings.copyBufferRegion(execCmdList, inputBuf, 0, uploadBuf, 0, inputBytes);
-
-            // 2b. Barrier: inputBuf COPY_DEST → UNORDERED_ACCESS (required for DML read)
             D3D12Bindings.transitionBarrier(execCmdList, inputBuf,
                     D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS, callArena);
-
-            // 2c. DML GEMM dispatch
             D3D12Bindings.setDescriptorHeaps(execCmdList, descriptorHeap, callArena);
             DirectMlBindings.recordDispatch(cmdRecorder, execCmdList, compiledGemm, execBindingTable);
-
-            // 2d. UAV barrier (ensure DML writes are visible)
             D3D12Bindings.uavBarrier(execCmdList, callArena);
-
-            // 2e. Barrier: outputBuf UNORDERED_ACCESS → COPY_SOURCE
             D3D12Bindings.transitionBarrier(execCmdList, outputBuf,
                     D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE, callArena);
-
-            // 2f. Copy outputBuf → readbackBuf
             D3D12Bindings.copyBufferRegion(execCmdList, readbackBuf, 0, outputBuf, 0, outputBytes);
-
-            // 2g. Reset resource states to COMMON for next call
-            //     (explicit transitions don't auto-decay, so we must reset manually)
             D3D12Bindings.transitionBarrier(execCmdList, inputBuf,
                     D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12Bindings.D3D12_RESOURCE_STATE_COMMON, callArena);
@@ -409,10 +427,8 @@ public final class MatMulNBitsKernel implements AutoCloseable {
                 Thread.onSpinWait();
             }
 
-            // 4. Read result from persistently-mapped readback buffer (CPU-side only)
-            float[] result = new float[N];
-            MemorySegment.copy(mappedReadback, ValueLayout.JAVA_FLOAT, 0, result, 0, N);
-            return result;
+            // 4. Read result from persistently-mapped readback buffer
+            MemorySegment.copy(mappedReadback, ValueLayout.JAVA_FLOAT, 0, out, 0, N);
 
         } catch (WindowsNativeException e) {
             throw new RuntimeException("MatMulNBitsKernel.matvec failed", e);
@@ -428,10 +444,14 @@ public final class MatMulNBitsKernel implements AutoCloseable {
      * <p>
      * Each byte in {@code qWeight} contains 2 uint4 values (low nibble first).
      * Weight value = (nibble - zero_point) * scale
+     * <p>
+     * This method is public so callers can fuse multiple quantized weight
+     * matrices (e.g., Q+K+V) by dequantizing separately, concatenating,
+     * and creating a kernel via {@link #fromDequantizedWeights}.
      *
      * @return float[N * K] row-major weight matrix
      */
-    static float[] dequantizeInt4(byte[] qWeight, float[] scales, byte[] zeroPoints,
+    public static float[] dequantizeInt4(byte[] qWeight, float[] scales, byte[] zeroPoints,
                                    int N, int K, int blockSize) {
         float[] result = new float[N * K];
         int blocksPerRow = K / blockSize;

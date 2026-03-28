@@ -50,6 +50,7 @@ public final class Phi3Runtime {
 
     // ── Pre-allocated decode buffers (seqLen=1, reused across layers) ─────
     private final float[] decBuf;         // general-purpose [hidden]
+    private final float[] decQKV;         // [3 * hidden] — fused QKV result (GPU)
     private final float[] decQ;           // [hidden]
     private final float[] decK;           // [hidden]
     private final float[] decV;           // [hidden]
@@ -102,6 +103,7 @@ public final class Phi3Runtime {
         int maxPos  = config.maxPositionEmbeddings();
 
         decBuf      = new float[hidden];
+        decQKV      = new float[hidden * 3];
         decQ        = new float[hidden];
         decK        = new float[hidden];
         decV        = new float[hidden];
@@ -308,12 +310,15 @@ public final class Phi3Runtime {
         double perToken = totalMs / profSteps;
         double pctDivisor = totalDecode > 0 ? totalDecode : 1;
 
+        int gpuLayers = (gpuKernels != null) ? gpuKernels.getGpuLayers() : 0;
+        int gpuSubmissions = gpuLayers * 4 + ((gpuKernels != null && gpuKernels.hasLmHead()) ? 1 : 0);
+
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("[Decode Profile] %d tokens, %.1f ms total, %.1f ms/token%n", profSteps, totalMs, perToken));
         sb.append(String.format("  Prefill:         %.1f ms (%d new tokens, %d cached)%n",
                 profPrefillNs / 1e6, profPrefillTokens, cachedSeqLen - profSteps - profPrefillTokens));
-        sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%)%n",
-                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor));
+        sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [QKV fused, %d submissions/tok]%n",
+                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor, gpuSubmissions));
         sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%)%n",
                 profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor));
         sb.append(String.format("  CPU norms+RoPE:  %.1f ms avg (%.0f%%)%n",
@@ -409,8 +414,7 @@ public final class Phi3Runtime {
 
     private void lmHeadMatvec(float[] x, float[] logits) {
         if (gpuKernels != null && gpuKernels.hasLmHead()) {
-            float[] result = gpuKernels.lmHead().matvec(x);
-            System.arraycopy(result, 0, logits, 0, result.length);
+            gpuKernels.lmHead().matvec(x, logits);
         } else {
             Arrays.fill(logits, 0);  // zero before matvec (accumulates via +=)
             weights.lmHead.matvec(x, logits);
@@ -462,19 +466,18 @@ public final class Phi3Runtime {
 
         // ── Q/K/V Projections (all read from decOProj = normed) ──────
         // IMPORTANT: QuantizedWeight.matvec() ACCUMULATES (y[n] += sum),
-        // so output buffers must be zeroed before each call.
+        // so output buffers must be zeroed before each CPU-path call.
         t0 = System.nanoTime();
-        Arrays.fill(decQ, 0);
-        Arrays.fill(decK, 0);
-        Arrays.fill(decV, 0);
         if (gpuLayer) {
-            float[] qRes = gpuKernels.qProj(layerIdx).matvec(decOProj);
-            System.arraycopy(qRes, 0, decQ, 0, hidden);
-            float[] kRes = gpuKernels.kProj(layerIdx).matvec(decOProj);
-            System.arraycopy(kRes, 0, decK, 0, hidden);
-            float[] vRes = gpuKernels.vProj(layerIdx).matvec(decOProj);
-            System.arraycopy(vRes, 0, decV, 0, hidden);
+            // Fused QKV: single GPU submission → result is [Q|K|V] = [3*hidden]
+            gpuKernels.qkvFused(layerIdx).matvec(decOProj, decQKV);
+            System.arraycopy(decQKV, 0,          decQ, 0, hidden);
+            System.arraycopy(decQKV, hidden,      decK, 0, hidden);
+            System.arraycopy(decQKV, 2 * hidden,  decV, 0, hidden);
         } else {
+            Arrays.fill(decQ, 0);
+            Arrays.fill(decK, 0);
+            Arrays.fill(decV, 0);
             lw.qProj().matvec(decOProj, decQ);
             lw.kProj().matvec(decOProj, decK);
             lw.vProj().matvec(decOProj, decV);
@@ -556,11 +559,10 @@ public final class Phi3Runtime {
         profCpuNormNs += System.nanoTime() - t0;
 
         t0 = System.nanoTime();
-        Arrays.fill(decOProj, 0);  // zero before matvec (accumulates via +=)
         if (gpuLayer) {
-            float[] oRes = gpuKernels.oProj(layerIdx).matvec(decAttnOut);
-            System.arraycopy(oRes, 0, decOProj, 0, hidden);
+            gpuKernels.oProj(layerIdx).matvec(decAttnOut, decOProj);
         } else {
+            Arrays.fill(decOProj, 0);  // zero before matvec (accumulates via +=)
             lw.oProj().matvec(decAttnOut, decOProj);
         }
         profGpuProjNs += System.nanoTime() - t0;
@@ -578,11 +580,10 @@ public final class Phi3Runtime {
 
         // ── MLP: gate_up_proj → decGateUp ────────────────────────────
         t0 = System.nanoTime();
-        Arrays.fill(decGateUp, 0);  // zero before matvec (accumulates via +=)
         if (gpuLayer) {
-            float[] guRes = gpuKernels.gateUpProj(layerIdx).matvec(decPostNorm);
-            System.arraycopy(guRes, 0, decGateUp, 0, guRes.length);
+            gpuKernels.gateUpProj(layerIdx).matvec(decPostNorm, decGateUp);
         } else {
+            Arrays.fill(decGateUp, 0);  // zero before matvec (accumulates via +=)
             lw.gateUpProj().matvec(decPostNorm, decGateUp);
         }
         profGpuProjNs += System.nanoTime() - t0;
@@ -606,11 +607,10 @@ public final class Phi3Runtime {
         profCpuNormNs += System.nanoTime() - t0;
 
         t0 = System.nanoTime();
-        Arrays.fill(decDown, 0);  // zero before matvec (accumulates via +=)
         if (gpuLayer) {
-            float[] dRes = gpuKernels.downProj(layerIdx).matvec(decMlpAct);
-            System.arraycopy(dRes, 0, decDown, 0, hidden);
+            gpuKernels.downProj(layerIdx).matvec(decMlpAct, decDown);
         } else {
+            Arrays.fill(decDown, 0);  // zero before matvec (accumulates via +=)
             lw.downProj().matvec(decMlpAct, decDown);
         }
         profGpuProjNs += System.nanoTime() - t0;
@@ -649,9 +649,15 @@ public final class Phi3Runtime {
         float[] v = new float[seqLen * hidden];
 
         if (gpuLayer) {
-            gpuMatmul(gpuKernels.qProj(layerIdx), normed, q, seqLen, hidden, hidden);
-            gpuMatmul(gpuKernels.kProj(layerIdx), normed, k, seqLen, hidden, hidden);
-            gpuMatmul(gpuKernels.vProj(layerIdx), normed, v, seqLen, hidden, hidden);
+            // Fused QKV: single GPU call per position → 3× fewer submissions
+            for (int s = 0; s < seqLen; s++) {
+                float[] row = new float[hidden];
+                System.arraycopy(normed, s * hidden, row, 0, hidden);
+                float[] qkvResult = gpuKernels.qkvFused(layerIdx).matvec(row);
+                System.arraycopy(qkvResult, 0,          q, s * hidden, hidden);
+                System.arraycopy(qkvResult, hidden,      k, s * hidden, hidden);
+                System.arraycopy(qkvResult, 2 * hidden,  v, s * hidden, hidden);
+            }
         } else {
             lw.qProj().matmul(normed, q, seqLen);
             lw.kProj().matmul(normed, k, seqLen);
