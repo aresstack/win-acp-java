@@ -4,6 +4,7 @@ import com.aresstack.winacp.inference.phi3.Phi3Config;
 import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
+import com.aresstack.winacp.inference.phi3.Phi3Tokenizer.ChatMessage;
 import com.aresstack.winacp.inference.phi3.Phi3Weights;
 import com.aresstack.winacp.windows.WindowsBindings;
 
@@ -72,6 +73,9 @@ public class Phi3ChatUI {
 
     // ── Chat history for clipboard export ────────────────────────────────
     private final List<String> chatHistory = new ArrayList<>();
+
+    // ── Conversation messages for multi-turn prompt building ─────────────
+    private final List<ChatMessage> conversationMessages = new ArrayList<>();
 
     // ── UI components ────────────────────────────────────────────────────
     private JFrame frame;
@@ -303,7 +307,9 @@ public class Phi3ChatUI {
 
         new Thread(() -> {
             try {
-                String prompt = tokenizer.formatChat(SYSTEM_PROMPT, userText);
+                // Build multi-turn prompt with full conversation history
+                conversationMessages.add(ChatMessage.user(userText));
+                String prompt = tokenizer.formatMultiTurnChat(SYSTEM_PROMPT, conversationMessages);
                 runtime.resetCache();
 
                 // Start bot message (streaming)
@@ -318,6 +324,9 @@ public class Phi3ChatUI {
                             tokenCount[0]++;
                             SwingUtilities.invokeLater(() -> appendBotChunk(delta));
                         });
+
+                // Record assistant response for future turns
+                conversationMessages.add(ChatMessage.assistant(response));
 
                 long elapsed = System.currentTimeMillis() - t0;
                 String stats = String.format("%d tokens, %.1f s, %.1f ms/token",

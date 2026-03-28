@@ -4,6 +4,7 @@ import com.aresstack.winacp.inference.phi3.Phi3Config;
 import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
+import com.aresstack.winacp.inference.phi3.Phi3Tokenizer.ChatMessage;
 import com.aresstack.winacp.inference.phi3.Phi3Weights;
 import com.aresstack.winacp.windows.WindowsBindings;
 
@@ -85,7 +86,7 @@ public class Phi3ChatCLI {
             "You are a helpful AI assistant. Answer concisely and accurately. " +
             "Respond in the same language the user writes in.";
 
-    private final List<Map<String, String>> conversationHistory = new ArrayList<>();
+    private final List<ChatMessage> conversationHistory = new ArrayList<>();
 
     // ── Output writer (always stdout, one JSON per line) ─────────────────
     private final PrintWriter out;
@@ -190,7 +191,11 @@ public class Phi3ChatCLI {
                         systemPrompt == null ? "System prompt cleared." : "System prompt set.");
             }
             case "/history" -> {
-                emitJson(mapOf("type", "history", "messages", conversationHistory));
+                List<Map<String, String>> historyList = new ArrayList<>();
+                for (ChatMessage msg : conversationHistory) {
+                    historyList.add(mapOf("role", msg.role(), "content", msg.content()));
+                }
+                emitJson(mapOf("type", "history", "messages", historyList));
             }
             case "/clear" -> {
                 conversationHistory.clear();
@@ -233,11 +238,11 @@ public class Phi3ChatCLI {
         String sysPrompt = stringVal(request, "systemPrompt");
         if (sysPrompt == null) sysPrompt = systemPrompt;
 
-        // Record user message
-        conversationHistory.add(mapOf("role", "user", "content", prompt));
+        // Record user message and build multi-turn prompt
+        conversationHistory.add(ChatMessage.user(prompt));
 
         try {
-            String formatted = tokenizer.formatChat(sysPrompt, prompt);
+            String formatted = tokenizer.formatMultiTurnChat(sysPrompt, conversationHistory);
             runtime.resetCache();
 
             long t0 = System.nanoTime();
@@ -256,8 +261,8 @@ public class Phi3ChatCLI {
             double msPerToken = tokenCount[0] > 0 ? elapsedMs / tokenCount[0] : 0;
             double tokensPerSec = tokenCount[0] > 0 ? tokenCount[0] / (elapsedMs / 1000.0) : 0;
 
-            // Record assistant message
-            conversationHistory.add(mapOf("role", "assistant", "content", response));
+            // Record assistant message for future turns
+            conversationHistory.add(ChatMessage.assistant(response));
 
             // Build timing info
             Map<String, Object> timings = new LinkedHashMap<>();

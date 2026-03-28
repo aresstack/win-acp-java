@@ -311,6 +311,17 @@ public final class Phi3Tokenizer {
     // ── Chat template ────────────────────────────────────────────────────
 
     /**
+     * A single message in a multi-turn conversation.
+     *
+     * @param role    either {@code "user"} or {@code "assistant"}
+     * @param content the message text
+     */
+    public record ChatMessage(String role, String content) {
+        public static ChatMessage user(String content) { return new ChatMessage("user", content); }
+        public static ChatMessage assistant(String content) { return new ChatMessage("assistant", content); }
+    }
+
+    /**
      * Format a single-turn chat prompt using Phi-3 chat template.
      *
      * <pre>
@@ -324,11 +335,40 @@ public final class Phi3Tokenizer {
      * @return formatted prompt string ready for encoding
      */
     public String formatChat(String systemPrompt, String userMessage) {
+        return formatMultiTurnChat(systemPrompt, List.of(ChatMessage.user(userMessage)));
+    }
+
+    /**
+     * Format a multi-turn chat prompt using Phi-3 chat template.
+     *
+     * <pre>
+     * &lt;|system|&gt;
+     * {systemPrompt}&lt;|end|&gt;
+     * &lt;|user|&gt;
+     * {message1}&lt;|end|&gt;
+     * &lt;|assistant|&gt;
+     * {reply1}&lt;|end|&gt;
+     * &lt;|user|&gt;
+     * {message2}&lt;|end|&gt;
+     * &lt;|assistant|&gt;
+     * </pre>
+     *
+     * @param systemPrompt optional system prompt (may be {@code null})
+     * @param messages     ordered list of user/assistant messages; the last
+     *                     message should typically be a user message
+     * @return formatted prompt string ready for encoding
+     */
+    public String formatMultiTurnChat(String systemPrompt, List<ChatMessage> messages) {
         StringBuilder sb = new StringBuilder();
         if (systemPrompt != null && !systemPrompt.isEmpty()) {
             sb.append("<|system|>\n").append(systemPrompt).append("<|end|>\n");
         }
-        sb.append("<|user|>\n").append(userMessage).append("<|end|>\n");
+        for (ChatMessage msg : messages) {
+            switch (msg.role()) {
+                case "user" -> sb.append("<|user|>\n").append(msg.content()).append("<|end|>\n");
+                case "assistant" -> sb.append("<|assistant|>\n").append(msg.content()).append("<|end|>\n");
+            }
+        }
         sb.append("<|assistant|>\n");
         return sb.toString();
     }
