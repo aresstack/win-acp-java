@@ -19,6 +19,13 @@ import java.util.Arrays;
  * replace this with a custom D3D12 compute shader operating directly on
  * packed INT4 data.
  * <p>
+ * <b>V1.1 performance optimization</b>: All per-call resources (staging buffers,
+ * command allocator, command list, fence, binding table) are pre-allocated at
+ * preparation time. The {@link #matvec(float[])} hot path combines upload,
+ * DML dispatch, and readback into a <b>single command list submission</b>,
+ * reducing GPU synchronization from 3× to 1× per call and eliminating
+ * COM object churn entirely.
+ * <p>
  * <b>Kernel contract</b>:
  * <ul>
  *   <li>Input:  x ∈ FP32 [M, K]  (M=1 for decode, M=seqLen for prefill)</li>
@@ -37,7 +44,7 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     private final int N;  // output features (rows of weight matrix)
     private final int K;  // input features  (cols of weight matrix)
 
-    // ── GPU resources ────────────────────────────────────────────────────
+    // ── GPU resources (created once at prepare time) ─────────────────────
     private MemorySegment weightBuf;     // GPU default buffer: dequantized FP32 [N, K]
     private MemorySegment biasBuf;       // GPU default buffer: zero-bias [N] (GEMM requires C tensor)
     private MemorySegment inputBuf;      // GPU default buffer: input [1, K] (reused per call)
@@ -55,6 +62,17 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     private long persistSize;
     private MemorySegment tempBuf;
     private MemorySegment persistBuf;
+
+    // ── Pre-allocated per-call resources (V1.1 optimization) ─────────────
+    private MemorySegment uploadBuf;        // upload heap: [K] floats, persistently mapped
+    private MemorySegment readbackBuf;      // readback heap: [N] floats, persistently mapped
+    private MemorySegment mappedUpload;     // persistently mapped CPU pointer for upload
+    private MemorySegment mappedReadback;   // persistently mapped CPU pointer for readback
+    private MemorySegment execAllocator;    // reusable command allocator
+    private MemorySegment execCmdList;      // reusable command list (reset per call)
+    private MemorySegment execBindingTable; // reusable DML binding table
+    private MemorySegment execFence;        // reusable fence (value increments per call)
+    private long fenceValue;                // monotonically increasing fence counter
 
     private boolean prepared = false;
     private boolean closed = false;
@@ -87,7 +105,7 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Preparation: dequantize → upload → compile
+    // Preparation: dequantize → upload → compile → pre-allocate exec infra
     // ══════════════════════════════════════════════════════════════════════
 
     private void prepare(byte[] qWeight, float[] scales, byte[] zeroPoints, int blockSize)
@@ -174,8 +192,79 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         // ── Step 8: Initialize the operator ───────────────────────────
         initializeOperator(dev, queue, dml);
 
+        // ── Step 9: Pre-allocate execution infrastructure (V1.1) ──────
+        prepareExecInfra(dev, dml, inputBytes, outputBytes);
+
         prepared = true;
-        log.info("MatMulNBitsKernel ready: [{}, {}] on GPU", N, K);
+        log.info("MatMulNBitsKernel ready: [{}, {}] on GPU (optimized single-submit)", N, K);
+    }
+
+    /**
+     * Pre-allocate all per-call resources: staging buffers (persistently mapped),
+     * command allocator, command list, fence, and binding table.
+     */
+    private void prepareExecInfra(MemorySegment dev, MemorySegment dml,
+                                   long inputBytes, long outputBytes)
+            throws WindowsNativeException {
+
+        // Staging buffers with persistent CPU mapping
+        uploadBuf   = D3D12Bindings.createUploadBuffer(dev, inputBytes, arena);
+        readbackBuf = D3D12Bindings.createReadbackBuffer(dev, outputBytes, arena);
+        mappedUpload   = D3D12Bindings.mapResource(uploadBuf, arena);
+        mappedReadback = D3D12Bindings.mapResource(readbackBuf, arena);
+
+        // Reusable command allocator + command list
+        execAllocator = D3D12Bindings.createCommandAllocator(dev,
+                D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
+        execCmdList = D3D12Bindings.createCommandList(dev,
+                D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, execAllocator, arena);
+        D3D12Bindings.closeCommandList(execCmdList); // close so we can Reset it later
+
+        // Reusable fence
+        execFence = D3D12Bindings.createFence(dev, 0, arena);
+        fenceValue = 0;
+
+        // Reusable execution binding table (bindings never change between calls)
+        long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+        long gpuBase = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap, arena);
+        int descOff = descCount + 4;
+
+        MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiledGemm,
+                cpuBase + (long) descOff * descriptorIncrement,
+                gpuBase + (long) descOff * descriptorIncrement, descCount);
+        execBindingTable = DirectMlBindings.createBindingTable(dml, btDesc, arena);
+
+        // Bind inputs: A=input, B=weight, C=bias (static — only data in inputBuf changes)
+        long weightBytes = (long) N * K * Float.BYTES;
+        long biasBytes   = (long) N * Float.BYTES;
+
+        MemorySegment inputs = arena.allocate(16L * 3, 8);
+        setBufferBinding(inputs, 0, inputBuf, inputBytes);
+        setBufferBinding(inputs, 1, weightBuf, weightBytes);
+        setBufferBinding(inputs, 2, biasBuf, biasBytes);
+        DirectMlBindings.bindInputs(execBindingTable, 3, inputs);
+
+        // Bind output
+        MemorySegment outputs = arena.allocate(16, 8);
+        setBufferBinding(outputs, 0, outputBuf, outputBytes);
+        DirectMlBindings.bindOutputs(execBindingTable, 1, outputs);
+
+        // Bind temp/persist
+        if (tempSize > 0 && tempBuf != null) {
+            MemorySegment bb = DirectMlBindings.allocBufferBinding(arena, tempBuf, 0, tempSize);
+            MemorySegment bd = DirectMlBindings.allocBindingDesc(arena,
+                    DirectMlBindings.DML_BINDING_TYPE_BUFFER, bb);
+            DirectMlBindings.bindTemporaryResource(execBindingTable, bd);
+        }
+        if (persistSize > 0 && persistBuf != null) {
+            MemorySegment bb = DirectMlBindings.allocBufferBinding(arena, persistBuf, 0, persistSize);
+            MemorySegment bd = DirectMlBindings.allocBindingDesc(arena,
+                    DirectMlBindings.DML_BINDING_TYPE_BUFFER, bb);
+            DirectMlBindings.bindPersistentResource(execBindingTable, bd);
+        }
+
+        log.debug("Execution infrastructure pre-allocated (upload={}, readback={}, fence, cmdList, bindingTable)",
+                inputBytes, outputBytes);
     }
 
     private void initializeOperator(MemorySegment dev, MemorySegment queue,
@@ -232,14 +321,23 @@ public final class MatMulNBitsKernel implements AutoCloseable {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Inference: matvec on GPU
+    // Inference: matvec on GPU (optimized single-submit)
     // ══════════════════════════════════════════════════════════════════════
 
     /**
      * Compute y = x @ W^T on GPU.
      * <p>
-     * This is the hot path. Input vector x[K] is uploaded, GEMM executes
-     * on GPU, result y[N] is read back.
+     * <b>V1.1 optimized hot path</b>: upload, DML dispatch, and readback are
+     * combined into a <b>single command list submission</b>. All resources
+     * (staging buffers, command allocator, command list, fence, binding table)
+     * are pre-allocated and reused across calls. Only one GPU synchronization
+     * point per call.
+     * <p>
+     * <b>Previous V1 hot path</b> had 3 separate GPU submissions (upload,
+     * dispatch, readback) with full fence wait each, plus creation and
+     * destruction of command allocators, command lists, binding tables,
+     * staging buffers, and fences on every call. This caused ~750 ms/token
+     * overhead for Phi-3 decode (193 matvec calls × 3 syncs = 579 GPU syncs).
      *
      * @param x input vector [K]
      * @return output vector [N]
@@ -251,75 +349,70 @@ public final class MatMulNBitsKernel implements AutoCloseable {
 
         var dev = wb.getD3d12Device();
         var queue = wb.getCommandQueue();
-        var dml = wb.getDmlDevice();
 
-        try {
-            // Upload input
-            D3D12Bindings.uploadFloats(dev, queue, inputBuf, x, arena);
+        try (var callArena = Arena.ofConfined()) {
+            long inputBytes  = (long) K * Float.BYTES;
+            long outputBytes = (long) N * Float.BYTES;
 
-            // Create binding table for execution
-            long cpuBase = D3D12Bindings.getCpuDescriptorHandleForHeapStart(descriptorHeap, arena);
-            long gpuBase = D3D12Bindings.getGpuDescriptorHandleForHeapStart(descriptorHeap, arena);
-            // Use offset past initialization descriptors
-            int descOff = descCount + 4;
+            // 1. Write input to persistently-mapped upload buffer (CPU-side only, no GPU command)
+            MemorySegment.copy(x, 0, mappedUpload, ValueLayout.JAVA_FLOAT, 0, K);
 
-            MemorySegment btDesc = DirectMlBindings.allocBindingTableDesc(arena, compiledGemm,
-                    cpuBase + (long) descOff * descriptorIncrement,
-                    gpuBase + (long) descOff * descriptorIncrement, descCount);
-            MemorySegment bt = DirectMlBindings.createBindingTable(dml, btDesc, arena);
+            // 2. Reset and record combined command list
+            D3D12Bindings.resetCommandAllocator(execAllocator);
+            D3D12Bindings.resetCommandList(execCmdList, execAllocator);
 
-            try {
-                // Bind inputs: A=input, B=weight, C=bias
-                long inputBytes  = (long) K * Float.BYTES;
-                long weightBytes = (long) N * K * Float.BYTES;
-                long biasBytes   = (long) N * Float.BYTES;
-                long outputBytes = (long) N * Float.BYTES;
+            // 2a. Copy upload buffer → inputBuf (COMMON auto-promotes to COPY_DEST)
+            D3D12Bindings.copyBufferRegion(execCmdList, inputBuf, 0, uploadBuf, 0, inputBytes);
 
-                MemorySegment inputs = arena.allocate(16L * 3, 8);
-                setBufferBinding(inputs, 0, inputBuf, inputBytes);
-                setBufferBinding(inputs, 1, weightBuf, weightBytes);
-                setBufferBinding(inputs, 2, biasBuf, biasBytes);
-                DirectMlBindings.bindInputs(bt, 3, inputs);
+            // 2b. Barrier: inputBuf COPY_DEST → UNORDERED_ACCESS (required for DML read)
+            D3D12Bindings.transitionBarrier(execCmdList, inputBuf,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS, callArena);
 
-                // Bind output
-                MemorySegment outputs = arena.allocate(16, 8);
-                setBufferBinding(outputs, 0, outputBuf, outputBytes);
-                DirectMlBindings.bindOutputs(bt, 1, outputs);
+            // 2c. DML GEMM dispatch
+            D3D12Bindings.setDescriptorHeaps(execCmdList, descriptorHeap, callArena);
+            DirectMlBindings.recordDispatch(cmdRecorder, execCmdList, compiledGemm, execBindingTable);
 
-                // Bind temp/persist
-                if (tempSize > 0 && tempBuf != null) {
-                    MemorySegment bb = DirectMlBindings.allocBufferBinding(arena, tempBuf, 0, tempSize);
-                    MemorySegment bd = DirectMlBindings.allocBindingDesc(arena,
-                            DirectMlBindings.DML_BINDING_TYPE_BUFFER, bb);
-                    DirectMlBindings.bindTemporaryResource(bt, bd);
+            // 2d. UAV barrier (ensure DML writes are visible)
+            D3D12Bindings.uavBarrier(execCmdList, callArena);
+
+            // 2e. Barrier: outputBuf UNORDERED_ACCESS → COPY_SOURCE
+            D3D12Bindings.transitionBarrier(execCmdList, outputBuf,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE, callArena);
+
+            // 2f. Copy outputBuf → readbackBuf
+            D3D12Bindings.copyBufferRegion(execCmdList, readbackBuf, 0, outputBuf, 0, outputBytes);
+
+            // 2g. Reset resource states to COMMON for next call
+            //     (explicit transitions don't auto-decay, so we must reset manually)
+            D3D12Bindings.transitionBarrier(execCmdList, inputBuf,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_COMMON, callArena);
+            D3D12Bindings.transitionBarrier(execCmdList, outputBuf,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12Bindings.D3D12_RESOURCE_STATE_COMMON, callArena);
+
+            // 3. Execute SINGLE combined command list + wait
+            D3D12Bindings.closeCommandList(execCmdList);
+            D3D12Bindings.executeCommandLists(queue, execCmdList, callArena);
+
+            fenceValue++;
+            D3D12Bindings.queueSignal(queue, execFence, fenceValue);
+
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (D3D12Bindings.fenceGetCompletedValue(execFence) < fenceValue) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new WindowsNativeException(
+                            "GPU fence timeout after 10000 ms – the GPU may be hung");
                 }
-                if (persistSize > 0 && persistBuf != null) {
-                    MemorySegment bb = DirectMlBindings.allocBufferBinding(arena, persistBuf, 0, persistSize);
-                    MemorySegment bd = DirectMlBindings.allocBindingDesc(arena,
-                            DirectMlBindings.DML_BINDING_TYPE_BUFFER, bb);
-                    DirectMlBindings.bindPersistentResource(bt, bd);
-                }
-
-                // Record and execute
-                var alloc = D3D12Bindings.createCommandAllocator(dev,
-                        D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, arena);
-                MemorySegment cmdList = null;
-                try {
-                    cmdList = D3D12Bindings.createCommandList(dev,
-                            D3D12Bindings.D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, arena);
-                    D3D12Bindings.setDescriptorHeaps(cmdList, descriptorHeap, arena);
-                    DirectMlBindings.recordDispatch(cmdRecorder, cmdList, compiledGemm, bt);
-                    D3D12Bindings.executeAndWait(dev, queue, cmdList, arena);
-                } finally {
-                    if (cmdList != null) DxgiBindings.release(cmdList);
-                    DxgiBindings.release(alloc);
-                }
-            } finally {
-                DxgiBindings.release(bt);
+                Thread.onSpinWait();
             }
 
-            // Readback result
-            return D3D12Bindings.readbackFloats(dev, queue, outputBuf, N, arena);
+            // 4. Read result from persistently-mapped readback buffer (CPU-side only)
+            float[] result = new float[N];
+            MemorySegment.copy(mappedReadback, ValueLayout.JAVA_FLOAT, 0, result, 0, N);
+            return result;
 
         } catch (WindowsNativeException e) {
             throw new RuntimeException("MatMulNBitsKernel.matvec failed", e);
@@ -406,7 +499,19 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         if (closed) return;
         closed = true;
 
-        // Release COM objects in reverse order
+        // Unmap persistently-mapped staging buffers
+        if (uploadBuf != null) D3D12Bindings.unmapResource(uploadBuf);
+        if (readbackBuf != null) D3D12Bindings.unmapResource(readbackBuf);
+
+        // Release pre-allocated execution infrastructure (reverse creation order)
+        if (execBindingTable != null) DxgiBindings.release(execBindingTable);
+        if (execFence != null) DxgiBindings.release(execFence);
+        if (execCmdList != null) DxgiBindings.release(execCmdList);
+        if (execAllocator != null) DxgiBindings.release(execAllocator);
+        if (readbackBuf != null) DxgiBindings.release(readbackBuf);
+        if (uploadBuf != null) DxgiBindings.release(uploadBuf);
+
+        // Release operator resources
         if (cmdRecorder != null) DxgiBindings.release(cmdRecorder);
         if (descriptorHeap != null) DxgiBindings.release(descriptorHeap);
         if (compiledGemm != null) DxgiBindings.release(compiledGemm);
