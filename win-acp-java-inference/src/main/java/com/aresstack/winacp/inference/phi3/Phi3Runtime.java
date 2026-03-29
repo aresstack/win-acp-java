@@ -61,6 +61,7 @@ public final class Phi3Runtime {
     private final Phi3Weights weights;
     private final Phi3Tokenizer tokenizer;
     private final Phi3GpuKernels gpuKernels;
+    private final Phi3GpuPipeline gpuPipeline;  // V2.0 shared pipeline (nullable)
 
     private final float[][][] kvCacheK;   // [layer][head][pos * headDim] — per-head K cache
     private final float[][][] kvCacheV;   // [layer][head][pos * headDim] — per-head V cache
@@ -114,7 +115,7 @@ public final class Phi3Runtime {
      * CPU-only constructor (backward compatible).
      */
     public Phi3Runtime(Phi3Config config, Phi3Weights weights, Phi3Tokenizer tokenizer) {
-        this(config, weights, tokenizer, null);
+        this(config, weights, tokenizer, null, null);
     }
 
     /**
@@ -122,10 +123,22 @@ public final class Phi3Runtime {
      */
     public Phi3Runtime(Phi3Config config, Phi3Weights weights, Phi3Tokenizer tokenizer,
                        Phi3GpuKernels gpuKernels) {
+        this(config, weights, tokenizer, gpuKernels, null);
+    }
+
+    /**
+     * Full constructor with V2.0 GPU pipeline support.
+     *
+     * @param gpuKernels  optional GPU kernel pool (fallback path)
+     * @param gpuPipeline optional V2.0 shared pipeline (preferred if non-null)
+     */
+    public Phi3Runtime(Phi3Config config, Phi3Weights weights, Phi3Tokenizer tokenizer,
+                       Phi3GpuKernels gpuKernels, Phi3GpuPipeline gpuPipeline) {
         this.config = config;
         this.weights = weights;
         this.tokenizer = tokenizer;
         this.gpuKernels = gpuKernels;
+        this.gpuPipeline = gpuPipeline;
         this.kvCacheK = new float[config.numHiddenLayers()][config.numKeyValueHeads()][];
         this.kvCacheV = new float[config.numHiddenLayers()][config.numKeyValueHeads()][];
         this.cachedSeqLen = 0;
@@ -154,7 +167,9 @@ public final class Phi3Runtime {
         decLogits   = new float[config.vocabSize()];
         decScoresPool = new float[config.numAttentionHeads() * maxPos];
 
-        if (gpuKernels != null) {
+        if (gpuPipeline != null) {
+            log.info("Phi3Runtime: V2.0 pipeline mode — shared cmd infra");
+        } else if (gpuKernels != null) {
             log.info("Phi3Runtime: GPU mode — {}/{} layers on GPU, lmHead={}",
                     gpuKernels.getGpuLayers(), config.numHiddenLayers(), gpuKernels.hasLmHead());
         } else {
@@ -349,13 +364,14 @@ public final class Phi3Runtime {
 
         int gpuLayers = (gpuKernels != null) ? gpuKernels.getGpuLayers() : 0;
         int gpuSubmissions = gpuLayers * 4 + ((gpuKernels != null && gpuKernels.hasLmHead()) ? 1 : 0);
+        String pipelineTag = gpuPipeline != null ? "V2.0 pipeline" : "V1.x per-kernel";
 
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("[Decode Profile] %d tokens, %.1f ms total, %.1f ms/token%n", profSteps, totalMs, perToken));
         sb.append(String.format("  Prefill:         %.1f ms (%d new tokens, %d cached)%n",
                 profPrefillNs / 1e6, profPrefillTokens, cachedSeqLen - profSteps - profPrefillTokens));
-        sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [QKV fused, %d submissions/tok]%n",
-                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor, gpuSubmissions));
+        sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [QKV fused, %d subs/tok, %s]%n",
+                profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor, gpuSubmissions, pipelineTag));
         sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%) [%d heads, parallel=%s]%n",
                 profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor,
                 config.numAttentionHeads(),
@@ -480,7 +496,9 @@ public final class Phi3Runtime {
     // ── LM head ──────────────────────────────────────────────────────────
 
     private void lmHeadMatvec(float[] x, float[] logits) {
-        if (gpuKernels != null && gpuKernels.hasLmHead()) {
+        if (gpuPipeline != null && gpuPipeline.hasLmHead()) {
+            gpuPipeline.lmHead(x, logits);
+        } else if (gpuKernels != null && gpuKernels.hasLmHead()) {
             gpuKernels.lmHead().matvec(x, logits);
         } else {
             Arrays.fill(logits, 0);  // zero before matvec (accumulates via +=)
@@ -520,7 +538,8 @@ public final class Phi3Runtime {
         int headDim = config.headDim();
         int kvHeads = config.numKeyValueHeads();
         LayerWeights lw = weights.layers[layerIdx];
-        boolean gpuLayer = gpuKernels != null && gpuKernels.hasLayer(layerIdx);
+        boolean pipelineLayer = gpuPipeline != null && gpuPipeline.hasLayer(layerIdx);
+        boolean gpuLayer = pipelineLayer || (gpuKernels != null && gpuKernels.hasLayer(layerIdx));
         long t0;
 
         // ── Pre-attention RMSNorm → decOProj (as "normed" temp) ──────
@@ -534,8 +553,14 @@ public final class Phi3Runtime {
         // IMPORTANT: QuantizedWeight.matvec() ACCUMULATES (y[n] += sum),
         // so output buffers must be zeroed before each CPU-path call.
         t0 = System.nanoTime();
-        if (gpuLayer) {
-            // Fused QKV: single GPU submission → result is [Q|K|V] = [3*hidden]
+        if (pipelineLayer) {
+            // V2.0: QKV via shared pipeline (shared allocator/cmdlist/fence)
+            gpuPipeline.qkvFused(layerIdx, decOProj, decQKV);
+            System.arraycopy(decQKV, 0,          decQ, 0, hidden);
+            System.arraycopy(decQKV, hidden,      decK, 0, hidden);
+            System.arraycopy(decQKV, 2 * hidden,  decV, 0, hidden);
+        } else if (gpuLayer) {
+            // V1.x fallback: per-kernel submission
             gpuKernels.qkvFused(layerIdx).matvec(decOProj, decQKV);
             System.arraycopy(decQKV, 0,          decQ, 0, hidden);
             System.arraycopy(decQKV, hidden,      decK, 0, hidden);
@@ -668,7 +693,9 @@ public final class Phi3Runtime {
         profCpuNormNs += System.nanoTime() - t0;
 
         t0 = System.nanoTime();
-        if (gpuLayer) {
+        if (pipelineLayer) {
+            gpuPipeline.oProj(layerIdx, decAttnOut, decOProj);
+        } else if (gpuLayer) {
             gpuKernels.oProj(layerIdx).matvec(decAttnOut, decOProj);
         } else {
             Arrays.fill(decOProj, 0);  // zero before matvec (accumulates via +=)
@@ -689,7 +716,9 @@ public final class Phi3Runtime {
 
         // ── MLP: gate_up_proj → decGateUp ────────────────────────────
         t0 = System.nanoTime();
-        if (gpuLayer) {
+        if (pipelineLayer) {
+            gpuPipeline.gateUpProj(layerIdx, decPostNorm, decGateUp);
+        } else if (gpuLayer) {
             gpuKernels.gateUpProj(layerIdx).matvec(decPostNorm, decGateUp);
         } else {
             Arrays.fill(decGateUp, 0);  // zero before matvec (accumulates via +=)
@@ -712,7 +741,9 @@ public final class Phi3Runtime {
         // ── down_proj → decDown ──────────────────────────────────────
 
         t0 = System.nanoTime();
-        if (gpuLayer) {
+        if (pipelineLayer) {
+            gpuPipeline.downProj(layerIdx, decMlpAct, decDown);
+        } else if (gpuLayer) {
             gpuKernels.downProj(layerIdx).matvec(decMlpAct, decDown);
         } else {
             Arrays.fill(decDown, 0);  // zero before matvec (accumulates via +=)

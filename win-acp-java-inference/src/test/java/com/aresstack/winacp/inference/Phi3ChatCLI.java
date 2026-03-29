@@ -2,6 +2,7 @@ package com.aresstack.winacp.inference;
 
 import com.aresstack.winacp.inference.phi3.Phi3Config;
 import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
+import com.aresstack.winacp.inference.phi3.Phi3GpuPipeline;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer.ChatMessage;
@@ -78,6 +79,7 @@ public class Phi3ChatCLI {
     private Phi3Runtime runtime;
     private WindowsBindings wb;
     private Phi3GpuKernels gpuKernels;
+    private Phi3GpuPipeline gpuPipeline;
     private volatile boolean modelReady = false;
     private String mode = "unknown";
 
@@ -346,18 +348,20 @@ public class Phi3ChatCLI {
                                 System.getProperty("phi3.gpu.lmhead", "true"));
                         gpuKernels = Phi3GpuKernels.create(
                                 wb, weights, config, gpuLayers, gpuLmHead);
-                        mode = "GPU (" + gpuKernels.getGpuLayers() + "/"
-                                + config.numHiddenLayers() + " layers)";
+                        gpuPipeline = new Phi3GpuPipeline(wb, gpuKernels, config);
+                        mode = "GPU V2.0 (" + gpuKernels.getGpuLayers() + "/"
+                                + config.numHiddenLayers() + " layers, pipeline)";
                     }
                 }
             } catch (Exception gpuEx) {
                 System.err.println("GPU init failed, falling back to CPU: " + gpuEx.getMessage());
                 gpuEx.printStackTrace(System.err);
+                if (gpuPipeline != null) { try { gpuPipeline.close(); } catch (Exception ignored) {} gpuPipeline = null; }
                 if (gpuKernels != null) { try { gpuKernels.close(); } catch (Exception ignored) {} gpuKernels = null; }
                 if (wb != null) { try { wb.close(); } catch (Exception ignored) {} wb = null; }
             }
 
-            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
+            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels, gpuPipeline);
 
             long elapsed = System.currentTimeMillis() - t0;
             modelReady = true;
@@ -379,6 +383,7 @@ public class Phi3ChatCLI {
     }
 
     private void cleanup() {
+        if (gpuPipeline != null) try { gpuPipeline.close(); } catch (Exception ignored) {}
         if (gpuKernels != null) try { gpuKernels.close(); } catch (Exception ignored) {}
         if (wb != null) try { wb.close(); } catch (Exception ignored) {}
     }

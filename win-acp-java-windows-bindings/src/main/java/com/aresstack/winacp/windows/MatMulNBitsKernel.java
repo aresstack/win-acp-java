@@ -5,7 +5,6 @@ import org.slf4j.LoggerFactory;
 
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
-import java.util.Arrays;
 
 /**
  * GPU-accelerated MatMulNBits kernel for AWQ INT4 block-128 quantized weights.
@@ -540,6 +539,125 @@ public final class MatMulNBitsKernel implements AutoCloseable {
             throw new RuntimeException("MatMulNBitsKernel.matvec failed", t);
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Pipeline-batched execution (V2.0 — record into external GpuPipeline)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Record this kernel's DML dispatch into an external {@link GpuPipeline}'s command list.
+     * <p>
+     * <b>V2.0 submission collapse</b>: Instead of a self-contained submit+wait cycle,
+     * this method only records the upload, barriers, DML dispatch, and readback into
+     * the pipeline's command list. No execution happens until
+     * {@link GpuPipeline#submitAndWait()} is called.
+     * <p>
+     * This allows batching multiple kernel dispatches into ONE command list submission
+     * with ONE fence wait, eliminating per-kernel synchronization overhead.
+     *
+     * @param pipeline the shared GPU pipeline (must be in recording state)
+     * @param x        input vector [K]
+     * @param out      output vector [N] (filled after pipeline.submitAndWait + pipeline.readbackInto)
+     */
+    public void recordInto(GpuPipeline pipeline, float[] x) {
+        if (!prepared) throw new IllegalStateException("Kernel not prepared");
+        if (x.length != K) throw new IllegalArgumentException(
+                "Input length " + x.length + " != K=" + K);
+
+        long inputBytes  = (long) K * Float.BYTES;
+        long outputBytes = (long) N * Float.BYTES;
+
+        try {
+            // 1. Write input to persistently-mapped upload buffer (kernel-local)
+            MemorySegment.copy(x, 0, mappedUpload, ValueLayout.JAVA_FLOAT, 0, K);
+
+            // 2. Record: upload → barrier → set heaps → dispatch → barrier → readback
+            var cl = pipeline.getCommandList();
+            mhCopyBufferRegion.invokeExact(cl, inputBuf, 0L, uploadBuf, 0L, inputBytes);
+            mhResourceBarrier.invokeExact(cl, 1, barrierInputToUAV);
+            mhSetDescriptorHeaps.invokeExact(cl, 1, heapArrayPtr);
+            mhRecordDispatch.invokeExact(cmdRecorder, cl, compiledGemm, execBindingTable);
+            mhResourceBarrier.invokeExact(cl, 1, barrierOutputToCS);
+            mhCopyBufferRegion.invokeExact(cl, readbackBuf, 0L, outputBuf, 0L, outputBytes);
+            mhResourceBarrier.invokeExact(cl, 1, barrierInputToCommon);
+            mhResourceBarrier.invokeExact(cl, 1, barrierOutputToCommon);
+        } catch (Throwable t) {
+            throw new RuntimeException("MatMulNBitsKernel.recordInto failed", t);
+        }
+    }
+
+    /**
+     * Read the result from this kernel's readback buffer into a Java array.
+     * Must be called AFTER the pipeline has been submitted and waited.
+     *
+     * @param out destination array [N]
+     */
+    public void readResult(float[] out) {
+        MemorySegment.copy(mappedReadback, ValueLayout.JAVA_FLOAT, 0, out, 0, N);
+    }
+
+    /**
+     * Record this kernel's dispatch that reads input from a GPU-resident buffer
+     * instead of uploading from CPU. Used when the activation is already on GPU
+     * (e.g., output of a previous operation in the same command list).
+     *
+     * @param pipeline       the shared GPU pipeline (recording state)
+     * @param gpuInputBuf    GPU default buffer containing the input [K] floats
+     * @param gpuInputBytes  byte size of the input data
+     */
+    public void recordIntoGpuResident(GpuPipeline pipeline, MemorySegment gpuInputBuf,
+                                       long gpuInputBytes) {
+        if (!prepared) throw new IllegalStateException("Kernel not prepared");
+
+        long outputBytes = (long) N * Float.BYTES;
+
+        try {
+            var cl = pipeline.getCommandList();
+            // Copy from GPU-resident source → this kernel's input buffer
+            mhCopyBufferRegion.invokeExact(cl, inputBuf, 0L, gpuInputBuf, 0L, gpuInputBytes);
+            mhResourceBarrier.invokeExact(cl, 1, barrierInputToUAV);
+            mhSetDescriptorHeaps.invokeExact(cl, 1, heapArrayPtr);
+            mhRecordDispatch.invokeExact(cmdRecorder, cl, compiledGemm, execBindingTable);
+            mhResourceBarrier.invokeExact(cl, 1, barrierOutputToCS);
+            // Leave output in COPY_SOURCE state (caller chains further or reads back)
+        } catch (Throwable t) {
+            throw new RuntimeException("MatMulNBitsKernel.recordIntoGpuResident failed", t);
+        }
+    }
+
+    /**
+     * Record the cleanup barriers to return buffers to COMMON state.
+     * Call after the last operation in a batch that uses this kernel's output.
+     */
+    public void recordCleanupBarriers(GpuPipeline pipeline) {
+        try {
+            var cl = pipeline.getCommandList();
+            mhResourceBarrier.invokeExact(cl, 1, barrierInputToCommon);
+            mhResourceBarrier.invokeExact(cl, 1, barrierOutputToCommon);
+        } catch (Throwable t) {
+            throw new RuntimeException("MatMulNBitsKernel.recordCleanupBarriers failed", t);
+        }
+    }
+
+    // ── GPU buffer accessors (for pipeline-batched operations) ─────────
+
+    /** GPU output buffer (default heap, UAV). Result is written here by DML dispatch. */
+    public MemorySegment getOutputBuf() { return outputBuf; }
+
+    /** GPU input buffer (default heap, UAV). */
+    public MemorySegment getInputBuf() { return inputBuf; }
+
+    /** Readback buffer (readback heap, mapped). */
+    public MemorySegment getReadbackBuf() { return readbackBuf; }
+
+    /** Mapped readback pointer. */
+    public MemorySegment getMappedReadback() { return mappedReadback; }
+
+    /** Mapped upload pointer. */
+    public MemorySegment getMappedUpload() { return mappedUpload; }
+
+    /** Upload buffer. */
+    public MemorySegment getUploadBuf() { return uploadBuf; }
 
     // ══════════════════════════════════════════════════════════════════════
     // INT4 dequantization (CPU, one-time)

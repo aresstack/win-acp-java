@@ -98,6 +98,18 @@ public final class ComIID {
             (byte) 0xbc, (byte) 0x79, (byte) 0x5b, (byte) 0x5c,
             (byte) 0x98, (byte) 0x04, (byte) 0x0f, (byte) 0xad);
 
+    /** IID_ID3D12RootSignature = {c54a6b66-72df-4ee8-8be5-a946a1429214} */
+    public static final byte[] IID_ID3D12RootSignature_BYTES = guidBytes(
+            0xc54a6b66, (short) 0x72df, (short) 0x4ee8,
+            (byte) 0x8b, (byte) 0xe5, (byte) 0xa9, (byte) 0x46,
+            (byte) 0xa1, (byte) 0x42, (byte) 0x92, (byte) 0x14);
+
+    /** IID_ID3D12PipelineState = {765a30f3-f624-4c6f-a828-ace948622445} */
+    public static final byte[] IID_ID3D12PipelineState_BYTES = guidBytes(
+            0x765a30f3, (short) 0xf624, (short) 0x4c6f,
+            (byte) 0xa8, (byte) 0x28, (byte) 0xac, (byte) 0xe9,
+            (byte) 0x48, (byte) 0x62, (byte) 0x24, (byte) 0x45);
+
     // ── DirectML extended ─────────────────────────────────────────────────
     /** IID_IDMLOperator = {26caae7a-3081-4633-9581-226fbe57695d} */
     public static final byte[] IID_IDMLOperator_BYTES = guidBytes(

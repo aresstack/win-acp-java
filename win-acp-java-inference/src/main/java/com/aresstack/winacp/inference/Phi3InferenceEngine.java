@@ -3,6 +3,7 @@ package com.aresstack.winacp.inference;
 import com.aresstack.winacp.config.InferenceConfiguration;
 import com.aresstack.winacp.inference.phi3.Phi3Config;
 import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
+import com.aresstack.winacp.inference.phi3.Phi3GpuPipeline;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
 import com.aresstack.winacp.inference.phi3.Phi3Weights;
@@ -60,6 +61,7 @@ public class Phi3InferenceEngine implements InferenceEngine {
     // GPU resources (created during initialize if backend != "cpu")
     private WindowsBindings wb;
     private Phi3GpuKernels gpuKernels;
+    private Phi3GpuPipeline gpuPipeline;  // V2.0 shared pipeline
 
     private boolean ready = false;
 
@@ -140,7 +142,9 @@ public class Phi3InferenceEngine implements InferenceEngine {
                                 System.getProperty("phi3.gpu.lmhead", "true"));
                         gpuKernels = Phi3GpuKernels.create(
                                 wb, weights, config, gpuLayers, gpuLmHead);
-                        log.info("GPU acceleration: {}/{} layers on GPU, lmHead={}",
+                        // V2.0: Create shared GPU pipeline
+                        gpuPipeline = new Phi3GpuPipeline(wb, gpuKernels, config);
+                        log.info("GPU acceleration: {}/{} layers on GPU, lmHead={}, pipeline=V2.0",
                                 gpuKernels.getGpuLayers(), config.numHiddenLayers(),
                                 gpuKernels.hasLmHead());
                     } else {
@@ -159,8 +163,8 @@ public class Phi3InferenceEngine implements InferenceEngine {
                 }
             }
 
-            // Create runtime (GPU kernels may be null → CPU-only)
-            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
+            // Create runtime (GPU pipeline may be null → fall back to kernels or CPU)
+            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels, gpuPipeline);
 
             ready = true;
             log.info("Phi3InferenceEngine ready ({}ms total, backend={})",
@@ -234,6 +238,12 @@ public class Phi3InferenceEngine implements InferenceEngine {
 
     /** Clean up GPU resources (idempotent). */
     private void cleanupGpu() {
+        if (gpuPipeline != null) {
+            try { gpuPipeline.close(); } catch (Exception e) {
+                log.warn("Error closing GPU pipeline: {}", e.getMessage());
+            }
+            gpuPipeline = null;
+        }
         if (gpuKernels != null) {
             try { gpuKernels.close(); } catch (Exception e) {
                 log.warn("Error closing GPU kernels: {}", e.getMessage());
