@@ -77,7 +77,7 @@ public final class MatMulNBitsKernel implements AutoCloseable {
 
     // ── Pre-allocated barrier/heap structs for zero-alloc hot path (V1.2) ─
     private MemorySegment barrierInputToUAV;      // transition: COPY_DEST → UAV
-    private MemorySegment barrierUAV;              // UAV barrier (no resource)
+    // V1.3: barrierUAV removed — redundant, transition barrier provides sync
     private MemorySegment barrierOutputToCS;       // transition: UAV → COPY_SOURCE
     private MemorySegment barrierInputToCommon;    // transition: UAV → COMMON
     private MemorySegment barrierOutputToCommon;   // transition: COPY_SOURCE → COMMON
@@ -278,11 +278,8 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         barrierInputToUAV = allocTransitionBarrier(inputBuf,
                 D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        // UAV barrier (all resources)
-        barrierUAV = arena.allocate(32, 8);
-        barrierUAV.set(ValueLayout.JAVA_INT, 0, D3D12Bindings.D3D12_RESOURCE_BARRIER_TYPE_UAV);
-        barrierUAV.set(ValueLayout.JAVA_INT, 4, D3D12Bindings.D3D12_RESOURCE_BARRIER_FLAG_NONE);
-        barrierUAV.set(ValueLayout.ADDRESS, 8, MemorySegment.NULL);
+        // V1.3: barrierUAV removed — the transition barrier output UAV→COPY_SOURCE
+        // already provides necessary synchronization for DML UAV writes.
         // Transition barrier: output UAV → COPY_SOURCE
         barrierOutputToCS = allocTransitionBarrier(outputBuf,
                 D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -502,12 +499,14 @@ public final class MatMulNBitsKernel implements AutoCloseable {
             HResult.check(hr, "CommandList::Reset");
 
             // 3. Record: upload → barrier → dispatch → barrier → readback
-            //    All using pre-cached MethodHandles and pre-allocated barriers
+            //    V1.3: Removed redundant UAV barrier (the transition barrier
+            //    output UAV→COPY_SOURCE already provides necessary synchronization).
+            //    Cleanup barriers to COMMON remain because D3D12 only decays
+            //    implicitly-promoted resources, not explicitly-transitioned ones.
             mhCopyBufferRegion.invokeExact(execCmdList, inputBuf, 0L, uploadBuf, 0L, inputBytes);
             mhResourceBarrier.invokeExact(execCmdList, 1, barrierInputToUAV);
             mhSetDescriptorHeaps.invokeExact(execCmdList, 1, heapArrayPtr);
             mhRecordDispatch.invokeExact(cmdRecorder, execCmdList, compiledGemm, execBindingTable);
-            mhResourceBarrier.invokeExact(execCmdList, 1, barrierUAV);
             mhResourceBarrier.invokeExact(execCmdList, 1, barrierOutputToCS);
             mhCopyBufferRegion.invokeExact(execCmdList, readbackBuf, 0L, outputBuf, 0L, outputBytes);
             mhResourceBarrier.invokeExact(execCmdList, 1, barrierInputToCommon);

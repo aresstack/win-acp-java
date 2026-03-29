@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.IntStream;
 
 /**
  * Decoder runtime for Phi-3-mini-4k-instruct.
@@ -33,6 +34,18 @@ import java.util.List;
  * consecutive positions from {@code numKvHeads * headDim * 4 = 12 KB} down to
  * {@code headDim * 4 = 384 bytes}, enabling hardware prefetching and dramatically
  * improving CPU cache utilization during attention (measured: ~8–10× faster attention).
+ *
+ * <p><b>V1.4 parallel attention</b>: attention heads are processed in parallel
+ * via {@code IntStream.parallel()} when seqLen exceeds a threshold (32).
+ * Each head writes to a non-overlapping slice of the output buffer, making
+ * the operation data-race-free. Per-head score buffers are pre-allocated
+ * to avoid heap allocation in the hot path. Expected speedup: 4–8× on
+ * the attention bottleneck (with 8+ CPU cores).
+ *
+ * <p><b>V1.4 ILP dot product</b>: 4-accumulator dot product in the inner
+ * attention loop for better instruction-level parallelism. Breaks the
+ * dependency chain on a single FP accumulator, enabling out-of-order
+ * execution to pipeline 4 independent FMA streams.
  *
  * <p>Constraints:
  * <ul>
@@ -69,8 +82,21 @@ public final class Phi3Runtime {
     private final float[] decGateUp;      // [intermediateSize * 2]
     private final float[] decMlpAct;      // [intermediateSize]
     private final float[] decDown;        // [hidden]
-    private final float[] decScores;      // [maxPositionEmbeddings] — attention scores
+    private final float[] decScores;      // [maxPositionEmbeddings] — attention scores (sequential path)
     private final float[] decLogits;      // [vocabSize]
+
+    // ── Per-head score buffers for parallel attention (V1.4) ─────────────
+    // Each head needs its own score buffer to avoid data races in parallel.
+    // Layout: flat [numHeads * maxPos] — decScoresPool[h * maxPos + p]
+    private final float[] decScoresPool;
+    private final int maxPos;
+
+    /**
+     * Sequence length threshold above which attention heads are processed
+     * in parallel. Below this threshold, thread scheduling overhead exceeds
+     * the parallelism benefit.
+     */
+    private static final int PARALLEL_ATTENTION_THRESHOLD = 32;
 
     // ── Decode profiling (accumulated per generation, reset on each call) ─
     private long profGpuProjNs;
@@ -110,6 +136,7 @@ public final class Phi3Runtime {
         int interX2 = config.intermediateSize() * 2;
         int inter   = config.intermediateSize();
         int maxPos  = config.maxPositionEmbeddings();
+        this.maxPos = maxPos;
 
         decBuf      = new float[hidden];
         decQKV      = new float[hidden * 3];
@@ -125,6 +152,7 @@ public final class Phi3Runtime {
         decDown     = new float[hidden];
         decScores   = new float[maxPos];
         decLogits   = new float[config.vocabSize()];
+        decScoresPool = new float[config.numAttentionHeads() * maxPos];
 
         if (gpuKernels != null) {
             log.info("Phi3Runtime: GPU mode — {}/{} layers on GPU, lmHead={}",
@@ -328,8 +356,10 @@ public final class Phi3Runtime {
                 profPrefillNs / 1e6, profPrefillTokens, cachedSeqLen - profSteps - profPrefillTokens));
         sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [QKV fused, %d submissions/tok]%n",
                 profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor, gpuSubmissions));
-        sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%)%n",
-                profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor));
+        sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%) [%d heads, parallel=%s]%n",
+                profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor,
+                config.numAttentionHeads(),
+                Runtime.getRuntime().availableProcessors() > 1 ? "yes (cores=" + Runtime.getRuntime().availableProcessors() + ")" : "no"));
         sb.append(String.format("  CPU norms+RoPE:  %.1f ms avg (%.0f%%)%n",
                 profCpuNormNs / 1e6 / profSteps, 100.0 * profCpuNormNs / pctDivisor));
         sb.append(String.format("  CPU SwiGLU:      %.1f ms avg (%.0f%%)%n",
@@ -539,37 +569,92 @@ public final class Phi3Runtime {
             System.arraycopy(decV, h * headDim, kvCacheV[layerIdx][h], pos * headDim, headDim);
         }
 
-        // ── Causal Self-Attention (per-head KV cache for locality) ───
+        // ── Causal Self-Attention (V1.4: parallel heads + 4-acc dot product) ─
         t0 = System.nanoTime();
         Arrays.fill(decAttnOut, 0, hidden, 0.0f);
         float scale = (float) (1.0 / Math.sqrt(headDim));
 
-        for (int h = 0; h < numHeads; h++) {
-            int kvH = h % kvHeads;
-            int qOff = h * headDim;
-            float[] kHead = kvCacheK[layerIdx][kvH];  // contiguous per-head K
-            float[] vHead = kvCacheV[layerIdx][kvH];  // contiguous per-head V
+        if (pos >= PARALLEL_ATTENTION_THRESHOLD) {
+            // Parallel path: process 32 heads concurrently via ForkJoinPool.
+            // Each head writes to a non-overlapping slice [h*headDim..(h+1)*headDim)
+            // of decAttnOut — no data race. Per-head scores are stored in
+            // decScoresPool[h*maxPos..h*maxPos+pos] to avoid heap allocation.
+            final int posF = pos;
+            final float scaleF = scale;
+            IntStream.range(0, numHeads).parallel().forEach(h -> {
+                int kvH = h % kvHeads;
+                int qOff = h * headDim;
+                float[] kHead = kvCacheK[layerIdx][kvH];
+                float[] vHead = kvCacheV[layerIdx][kvH];
+                int scoreBase = h * maxPos;
 
-            // Dot products: Q · K for all cached positions (sequential K access)
-            for (int p = 0; p <= pos; p++) {
-                int kOff = p * headDim;
-                float dot = 0;
-                for (int d = 0; d < headDim; d++) {
-                    dot += decQ[qOff + d] * kHead[kOff + d];
+                // Q·K dot products with 4-accumulator ILP
+                for (int p = 0; p <= posF; p++) {
+                    int kOff = p * headDim;
+                    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    int d = 0;
+                    for (; d + 3 < headDim; d += 4) {
+                        d0 += decQ[qOff + d]     * kHead[kOff + d];
+                        d1 += decQ[qOff + d + 1] * kHead[kOff + d + 1];
+                        d2 += decQ[qOff + d + 2] * kHead[kOff + d + 2];
+                        d3 += decQ[qOff + d + 3] * kHead[kOff + d + 3];
+                    }
+                    float dot = d0 + d1 + d2 + d3;
+                    for (; d < headDim; d++) {
+                        dot += decQ[qOff + d] * kHead[kOff + d];
+                    }
+                    decScoresPool[scoreBase + p] = dot * scaleF;
                 }
-                decScores[p] = dot * scale;
-            }
 
-            // Softmax over [0..pos]
-            softmax(decScores, pos + 1);
+                // In-place softmax over [scoreBase..scoreBase+pos]
+                softmaxSlice(decScoresPool, scoreBase, posF + 1);
 
-            // Weighted sum of V (sequential V access)
-            int outOff = h * headDim;
-            for (int p = 0; p <= pos; p++) {
-                int vOff = p * headDim;
-                float w = decScores[p];
-                for (int d = 0; d < headDim; d++) {
-                    decAttnOut[outOff + d] += w * vHead[vOff + d];
+                // Weighted sum of V
+                int outOff = h * headDim;
+                for (int p = 0; p <= posF; p++) {
+                    float w = decScoresPool[scoreBase + p];
+                    if (w < 1e-8f) continue;  // skip negligible weights
+                    int vOff = p * headDim;
+                    for (int d = 0; d < headDim; d++) {
+                        decAttnOut[outOff + d] += w * vHead[vOff + d];
+                    }
+                }
+            });
+        } else {
+            // Sequential path for short sequences (avoids thread scheduling overhead)
+            for (int h = 0; h < numHeads; h++) {
+                int kvH = h % kvHeads;
+                int qOff = h * headDim;
+                float[] kHead = kvCacheK[layerIdx][kvH];
+                float[] vHead = kvCacheV[layerIdx][kvH];
+
+                // Q·K dot products with 4-accumulator ILP
+                for (int p = 0; p <= pos; p++) {
+                    int kOff = p * headDim;
+                    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    int d = 0;
+                    for (; d + 3 < headDim; d += 4) {
+                        d0 += decQ[qOff + d]     * kHead[kOff + d];
+                        d1 += decQ[qOff + d + 1] * kHead[kOff + d + 1];
+                        d2 += decQ[qOff + d + 2] * kHead[kOff + d + 2];
+                        d3 += decQ[qOff + d + 3] * kHead[kOff + d + 3];
+                    }
+                    float dot = d0 + d1 + d2 + d3;
+                    for (; d < headDim; d++) {
+                        dot += decQ[qOff + d] * kHead[kOff + d];
+                    }
+                    decScores[p] = dot * scale;
+                }
+
+                softmax(decScores, pos + 1);
+
+                int outOff = h * headDim;
+                for (int p = 0; p <= pos; p++) {
+                    int vOff = p * headDim;
+                    float w = decScores[p];
+                    for (int d = 0; d < headDim; d++) {
+                        decAttnOut[outOff + d] += w * vHead[vOff + d];
+                    }
                 }
             }
         }
@@ -612,23 +697,19 @@ public final class Phi3Runtime {
         }
         profGpuProjNs += System.nanoTime() - t0;
 
-        // ── SwiGLU activation → decMlpAct ────────────────────────────
+        // ── SwiGLU activation + MLP scale (fused, V1.4) → decMlpAct ─────
         t0 = System.nanoTime();
         int intermediate = config.intermediateSize();
+        float[] mlpScale = lw.mlpOutScale();
         for (int i = 0; i < intermediate; i++) {
             float gate = decGateUp[i];
             float up = decGateUp[intermediate + i];
             float sigmoid = 1.0f / (1.0f + (float) Math.exp(-gate));
-            decMlpAct[i] = up * gate * sigmoid;
+            decMlpAct[i] = up * gate * sigmoid * mlpScale[i];
         }
         profCpuActNs += System.nanoTime() - t0;
 
-        // ── Activation scale + down_proj → decDown ───────────────────
-        t0 = System.nanoTime();
-        for (int i = 0; i < intermediate; i++) {
-            decMlpAct[i] *= lw.mlpOutScale()[i];
-        }
-        profCpuNormNs += System.nanoTime() - t0;
+        // ── down_proj → decDown ──────────────────────────────────────
 
         t0 = System.nanoTime();
         if (gpuLayer) {
@@ -870,6 +951,24 @@ public final class Phi3Runtime {
         }
         float invSum = 1.0f / sum;
         for (int i = 0; i < len; i++) x[i] *= invSum;
+    }
+
+    /**
+     * In-place softmax over a slice of a shared array.
+     * Operates on {@code x[offset..offset+len-1]}.
+     * Used by parallel attention to avoid per-head array allocation.
+     */
+    static void softmaxSlice(float[] x, int offset, int len) {
+        float max = Float.NEGATIVE_INFINITY;
+        int end = offset + len;
+        for (int i = offset; i < end; i++) if (x[i] > max) max = x[i];
+        float sum = 0;
+        for (int i = offset; i < end; i++) {
+            x[i] = (float) Math.exp(x[i] - max);
+            sum += x[i];
+        }
+        float invSum = 1.0f / sum;
+        for (int i = offset; i < end; i++) x[i] *= invSum;
     }
 
     /**
