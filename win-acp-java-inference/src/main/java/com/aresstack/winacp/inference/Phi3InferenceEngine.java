@@ -144,6 +144,7 @@ public class Phi3InferenceEngine implements InferenceEngine {
                                 wb, weights, config, gpuLayers, gpuLmHead);
                         // V2.0: Create shared GPU pipeline
                         gpuPipeline = new Phi3GpuPipeline(wb, gpuKernels, config);
+                        gpuPipeline.uploadLayerWeights(wb, weights, config);
                         log.info("GPU acceleration: {}/{} layers on GPU, lmHead={}, pipeline=V2.0",
                                 gpuKernels.getGpuLayers(), config.numHiddenLayers(),
                                 gpuKernels.hasLmHead());

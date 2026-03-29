@@ -349,6 +349,7 @@ public class Phi3ChatCLI {
                         gpuKernels = Phi3GpuKernels.create(
                                 wb, weights, config, gpuLayers, gpuLmHead);
                         gpuPipeline = new Phi3GpuPipeline(wb, gpuKernels, config);
+                        gpuPipeline.uploadLayerWeights(wb, weights, config);
                         mode = "GPU V2.0 (" + gpuKernels.getGpuLayers() + "/"
                                 + config.numHiddenLayers() + " layers, pipeline)";
                     }

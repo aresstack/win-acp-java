@@ -639,6 +639,61 @@ public final class MatMulNBitsKernel implements AutoCloseable {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // MLP-batch mode (V2.0 — no readback, no cleanup, output stays in UAV)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Record upload from CPU + DML dispatch for batch mode.
+     * <p>
+     * Output buffer stays in UAV state after the dispatch — caller is responsible
+     * for any subsequent transitions and barriers. No readback copy is recorded.
+     * <p>
+     * After the batch's {@link GpuPipeline#submitAndWait()}, all buffers automatically
+     * decay back to COMMON state (D3D12 buffer decay rule).
+     *
+     * @param pipeline shared GPU pipeline (recording state)
+     * @param x        input vector [K] from CPU
+     */
+    public void recordBatchFromCpu(GpuPipeline pipeline, float[] x) {
+        if (!prepared) throw new IllegalStateException("Kernel not prepared");
+        if (x.length != K) throw new IllegalArgumentException(
+                "Input length " + x.length + " != K=" + K);
+        long inputBytes = (long) K * Float.BYTES;
+        try {
+            MemorySegment.copy(x, 0, mappedUpload, ValueLayout.JAVA_FLOAT, 0, K);
+            var cl = pipeline.getCommandList();
+            mhCopyBufferRegion.invokeExact(cl, inputBuf, 0L, uploadBuf, 0L, inputBytes);
+            mhResourceBarrier.invokeExact(cl, 1, barrierInputToUAV);
+            mhSetDescriptorHeaps.invokeExact(cl, 1, heapArrayPtr);
+            mhRecordDispatch.invokeExact(cmdRecorder, cl, compiledGemm, execBindingTable);
+            // Output stays in UAV — no readback, no cleanup
+        } catch (Throwable t) {
+            throw new RuntimeException("MatMulNBitsKernel.recordBatchFromCpu failed", t);
+        }
+    }
+
+    /**
+     * Record only the DML dispatch — input buffer already contains data in UAV state
+     * (written by a preceding compute shader, e.g., RMSNorm or SwiGLU).
+     * <p>
+     * Caller must ensure a UAV barrier between the compute write and this dispatch.
+     * Output buffer stays in UAV after dispatch.
+     *
+     * @param pipeline shared GPU pipeline (recording state)
+     */
+    public void recordBatchDispatchOnly(GpuPipeline pipeline) {
+        if (!prepared) throw new IllegalStateException("Kernel not prepared");
+        try {
+            var cl = pipeline.getCommandList();
+            mhSetDescriptorHeaps.invokeExact(cl, 1, heapArrayPtr);
+            mhRecordDispatch.invokeExact(cmdRecorder, cl, compiledGemm, execBindingTable);
+            // Output stays in UAV
+        } catch (Throwable t) {
+            throw new RuntimeException("MatMulNBitsKernel.recordBatchDispatchOnly failed", t);
+        }
+    }
+
     // ── GPU buffer accessors (for pipeline-batched operations) ─────────
 
     /** GPU output buffer (default heap, UAV). Result is written here by DML dispatch. */

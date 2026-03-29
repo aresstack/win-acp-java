@@ -363,8 +363,10 @@ public final class Phi3Runtime {
         double pctDivisor = totalDecode > 0 ? totalDecode : 1;
 
         int gpuLayers = (gpuKernels != null) ? gpuKernels.getGpuLayers() : 0;
-        int gpuSubmissions = gpuLayers * 4 + ((gpuKernels != null && gpuKernels.hasLmHead()) ? 1 : 0);
-        String pipelineTag = gpuPipeline != null ? "V2.0 pipeline" : "V1.x per-kernel";
+        boolean mlpBatch = gpuPipeline != null && gpuPipeline.isMlpBatchEnabled();
+        int subsPerLayer = mlpBatch ? 2 : 4;  // QKV + MLP_batch vs QKV + O + GateUp + Down
+        int gpuSubmissions = gpuLayers * subsPerLayer + ((gpuKernels != null && gpuKernels.hasLmHead()) ? 1 : 0);
+        String pipelineTag = mlpBatch ? "V2.0 MLP-batch" : (gpuPipeline != null ? "V2.0 pipeline" : "V1.x per-kernel");
 
         StringBuilder sb = new StringBuilder();
         sb.append(String.format("[Decode Profile] %d tokens, %.1f ms total, %.1f ms/token%n", profSteps, totalMs, perToken));
@@ -685,20 +687,36 @@ public final class Phi3Runtime {
         }
         profCpuAttnNs += System.nanoTime() - t0;
 
-        // ── Activation scale + O projection → decOProj ───────────────
+        // ── Activation scale (always CPU — fast element-wise) ─────────
         t0 = System.nanoTime();
         for (int i = 0; i < hidden; i++) {
             decAttnOut[i] *= lw.attnOutScale()[i];
         }
         profCpuNormNs += System.nanoTime() - t0;
 
+        // ══════════════════════════════════════════════════════════════
+        // V2.0 MLP BATCH: 7 GPU ops in 1 submission (65 subs/token)
+        //   O_proj → add(residual) → RMSNorm → GateUp → SwiGLU → Down → add
+        // ══════════════════════════════════════════════════════════════
+        if (pipelineLayer && gpuPipeline.isMlpBatchEnabled()) {
+            t0 = System.nanoTime();
+            gpuPipeline.batchMlp(decAttnOut, hidden_io, hidden_io, layerIdx);
+            profGpuProjNs += System.nanoTime() - t0;
+            return;  // hidden_io updated in-place — layer done
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Fallback: per-kernel dispatch (V1.x path)
+        // ══════════════════════════════════════════════════════════════
+
+        // ── O projection → decOProj ──────────────────────────────────
         t0 = System.nanoTime();
         if (pipelineLayer) {
             gpuPipeline.oProj(layerIdx, decAttnOut, decOProj);
         } else if (gpuLayer) {
             gpuKernels.oProj(layerIdx).matvec(decAttnOut, decOProj);
         } else {
-            Arrays.fill(decOProj, 0);  // zero before matvec (accumulates via +=)
+            Arrays.fill(decOProj, 0);
             lw.oProj().matvec(decAttnOut, decOProj);
         }
         profGpuProjNs += System.nanoTime() - t0;
@@ -721,12 +739,12 @@ public final class Phi3Runtime {
         } else if (gpuLayer) {
             gpuKernels.gateUpProj(layerIdx).matvec(decPostNorm, decGateUp);
         } else {
-            Arrays.fill(decGateUp, 0);  // zero before matvec (accumulates via +=)
+            Arrays.fill(decGateUp, 0);
             lw.gateUpProj().matvec(decPostNorm, decGateUp);
         }
         profGpuProjNs += System.nanoTime() - t0;
 
-        // ── SwiGLU activation + MLP scale (fused, V1.4) → decMlpAct ─────
+        // ── SwiGLU activation + MLP scale (fused, V1.4) → decMlpAct ─
         t0 = System.nanoTime();
         int intermediate = config.intermediateSize();
         float[] mlpScale = lw.mlpOutScale();
@@ -739,14 +757,13 @@ public final class Phi3Runtime {
         profCpuActNs += System.nanoTime() - t0;
 
         // ── down_proj → decDown ──────────────────────────────────────
-
         t0 = System.nanoTime();
         if (pipelineLayer) {
             gpuPipeline.downProj(layerIdx, decMlpAct, decDown);
         } else if (gpuLayer) {
             gpuKernels.downProj(layerIdx).matvec(decMlpAct, decDown);
         } else {
-            Arrays.fill(decDown, 0);  // zero before matvec (accumulates via +=)
+            Arrays.fill(decDown, 0);
             lw.downProj().matvec(decMlpAct, decDown);
         }
         profGpuProjNs += System.nanoTime() - t0;
