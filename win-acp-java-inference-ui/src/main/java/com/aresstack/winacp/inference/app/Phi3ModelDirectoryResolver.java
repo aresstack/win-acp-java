@@ -3,13 +3,8 @@ package com.aresstack.winacp.inference.app;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 
 final class Phi3ModelDirectoryResolver {
-
-    private static final String RELATIVE_MODEL_DIR =
-            "model/phi3-mini-directml-int4/directml/directml-int4-awq-block-128";
 
     private Phi3ModelDirectoryResolver() {
     }
@@ -21,31 +16,20 @@ final class Phi3ModelDirectoryResolver {
         }
 
         Path jarDirectory = resolveJarDirectory();
+        if (jarDirectory != null && containsModelFiles(jarDirectory)) {
+            return jarDirectory;
+        }
+
         Path workingDirectory = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
-
-        List<Path> candidates = new ArrayList<Path>();
-        if (jarDirectory != null) {
-            candidates.add(jarDirectory.resolve(RELATIVE_MODEL_DIR));
-        }
-        candidates.add(workingDirectory.resolve(RELATIVE_MODEL_DIR));
-
-        Path parentDirectory = workingDirectory.getParent();
-        if (parentDirectory != null) {
-            candidates.add(parentDirectory.resolve(RELATIVE_MODEL_DIR));
-        }
-
-        for (Path candidate : candidates) {
-            Path normalizedCandidate = candidate.toAbsolutePath().normalize();
-            if (containsModel(normalizedCandidate)) {
-                return normalizedCandidate;
-            }
+        if (containsModelFiles(workingDirectory)) {
+            return workingDirectory;
         }
 
         if (jarDirectory != null) {
-            return jarDirectory.resolve(RELATIVE_MODEL_DIR).toAbsolutePath().normalize();
+            return jarDirectory;
         }
 
-        return workingDirectory.resolve(RELATIVE_MODEL_DIR).toAbsolutePath().normalize();
+        return workingDirectory;
     }
 
     private static Path resolveConfiguredModelDir() {
@@ -65,18 +49,23 @@ final class Phi3ModelDirectoryResolver {
                     .getLocation()
                     .toURI();
 
-            Path path = Path.of(location).toAbsolutePath().normalize();
-            if (Files.isDirectory(path)) {
-                return path;
+            Path locationPath = Path.of(location).toAbsolutePath().normalize();
+            if (Files.isDirectory(locationPath)) {
+                return locationPath;
             }
 
-            return path.getParent();
+            Path parent = locationPath.getParent();
+            if (parent == null) {
+                return locationPath;
+            }
+
+            return parent;
         } catch (Exception ignored) {
             return null;
         }
     }
 
-    private static boolean containsModel(Path directory) {
+    private static boolean containsModelFiles(Path directory) {
         return Files.isRegularFile(directory.resolve("config.json"))
                 && Files.isRegularFile(directory.resolve("tokenizer.json"))
                 && Files.isRegularFile(directory.resolve("model.onnx"))
