@@ -7,3 +7,5 @@ include 'win-acp-java-inference'
 include 'win-acp-java-windows-bindings'
 include 'win-acp-java-acp'
 include 'win-acp-java-runtime'
+
+include 'win-acp-java-inference-ui'

@@ -76,15 +76,17 @@ public final class WindowsBindings implements AutoCloseable {
             throw new WindowsNativeException("Not running on Windows – native bindings unavailable");
         }
 
-        // 1. DXGI Factory
+// 1. DXGI Factory
+        int adapterIndex = Integer.getInteger("winacp.dxgi.adapterIndex", 0);
+
         dxgiFactory = DxgiBindings.createFactory1(arena);
 
-        // 2. First hardware adapter
-        dxgiAdapter = DxgiBindings.enumAdapters1(dxgiFactory, 0, arena);
+// 2. First hardware adapter
+        dxgiAdapter = DxgiBindings.enumAdapters1(dxgiFactory, adapterIndex, arena);
         if (dxgiAdapter == null) {
-            throw new WindowsNativeException("No DXGI adapters found on this system");
+            throw new WindowsNativeException("No DXGI adapter found at index " + adapterIndex);
         }
-        log.info("Using DXGI adapter at index 0: {}", dxgiAdapter);
+        log.info("Using DXGI adapter at index {}: {}", adapterIndex, dxgiAdapter);
 
         // 3. D3D12 device
         d3d12Device = D3D12Bindings.createDevice(
@@ -117,13 +119,33 @@ public final class WindowsBindings implements AutoCloseable {
 
     // ── Accessors for downstream code ────────────────────────────────────
 
-    public MemorySegment getDxgiFactory()   { return dxgiFactory; }
-    public MemorySegment getDxgiAdapter()   { return dxgiAdapter; }
-    public MemorySegment getD3d12Device()   { return d3d12Device; }
-    public MemorySegment getCommandQueue()  { return commandQueue; }
-    public MemorySegment getDmlDevice()     { return dmlDevice; }
-    public boolean isInitialised()          { return initialised; }
-    public boolean hasDirectMl()            { return dmlDevice != null; }
+    public MemorySegment getDxgiFactory() {
+        return dxgiFactory;
+    }
+
+    public MemorySegment getDxgiAdapter() {
+        return dxgiAdapter;
+    }
+
+    public MemorySegment getD3d12Device() {
+        return d3d12Device;
+    }
+
+    public MemorySegment getCommandQueue() {
+        return commandQueue;
+    }
+
+    public MemorySegment getDmlDevice() {
+        return dmlDevice;
+    }
+
+    public boolean isInitialised() {
+        return initialised;
+    }
+
+    public boolean hasDirectMl() {
+        return dmlDevice != null;
+    }
 
     @Override
     public void close() {
@@ -133,11 +155,11 @@ public final class WindowsBindings implements AutoCloseable {
         log.info("WindowsBindings closing – releasing COM objects");
 
         // Release in reverse creation order; null-safe
-        safeRelease(dmlDevice,    "DML device");
+        safeRelease(dmlDevice, "DML device");
         safeRelease(commandQueue, "command queue");
-        safeRelease(d3d12Device,  "D3D12 device");
-        safeRelease(dxgiAdapter,  "DXGI adapter");
-        safeRelease(dxgiFactory,  "DXGI factory");
+        safeRelease(d3d12Device, "D3D12 device");
+        safeRelease(dxgiAdapter, "DXGI adapter");
+        safeRelease(dxgiFactory, "DXGI factory");
 
         dmlDevice = null;
         commandQueue = null;
@@ -150,7 +172,9 @@ public final class WindowsBindings implements AutoCloseable {
         log.info("WindowsBindings closed");
     }
 
-    /** Null-safe COM Release with error logging (never throws). */
+    /**
+     * Null-safe COM Release with error logging (never throws).
+     */
     private static void safeRelease(MemorySegment comPtr, String label) {
         if (comPtr == null || comPtr.equals(MemorySegment.NULL)) return;
         try {

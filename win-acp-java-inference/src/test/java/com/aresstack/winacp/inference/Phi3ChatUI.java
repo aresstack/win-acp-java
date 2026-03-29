@@ -57,6 +57,20 @@ public class Phi3ChatUI {
         return rel;
     }
 
+    private static String resolveBackend() {
+        String value = System.getProperty("phi3.backend", "cpu");
+        if (value == null) {
+            return "cpu";
+        }
+
+        String normalized = value.trim().toLowerCase();
+        if ("cpu".equals(normalized) || "directml".equals(normalized) || "auto".equals(normalized)) {
+            return normalized;
+        }
+
+        return "cpu";
+    }
+
     // ── State ────────────────────────────────────────────────────────────
     private Phi3Config config;
     private Phi3Tokenizer tokenizer;
@@ -237,28 +251,48 @@ public class Phi3ChatUI {
             tokenizer = Phi3Tokenizer.load(MODEL_DIR.resolve("tokenizer.json"));
             weights = Phi3Weights.load(MODEL_DIR, config);
 
-            // ── Try GPU acceleration ─────────────────────────────────
+            String backend = resolveBackend();
             String mode = "CPU";
+
             try {
-                if (WindowsBindings.isSupported()) {
+                if (!"cpu".equals(backend) && WindowsBindings.isSupported()) {
                     wb = new WindowsBindings();
-                    wb.init("directml");
+                    wb.init(backend);
+
                     if (wb.hasDirectMl()) {
                         int gpuLayers = Integer.getInteger("phi3.gpu.layers",
                                 config.numHiddenLayers());
                         boolean gpuLmHead = Boolean.parseBoolean(
                                 System.getProperty("phi3.gpu.lmhead", "true"));
+
                         gpuKernels = Phi3GpuKernels.create(
                                 wb, weights, config, gpuLayers, gpuLmHead);
+
                         mode = "GPU (" + gpuKernels.getGpuLayers() + "/"
                                 + config.numHiddenLayers() + " layers)";
                     }
                 }
             } catch (Exception gpuEx) {
-                System.err.println("GPU init failed, falling back to CPU: " + gpuEx.getMessage());
+                System.err.println("GPU init failed, continue on CPU: " + gpuEx.getMessage());
                 gpuEx.printStackTrace();
-                if (gpuKernels != null) { try { gpuKernels.close(); } catch (Exception ignored) {} gpuKernels = null; }
-                if (wb != null) { try { wb.close(); } catch (Exception ignored) {} wb = null; }
+
+                if (gpuKernels != null) {
+                    try {
+                        gpuKernels.close();
+                    } catch (Exception ignored) {
+                    }
+                    gpuKernels = null;
+                }
+
+                if (wb != null) {
+                    try {
+                        wb.close();
+                    } catch (Exception ignored) {
+                    }
+                    wb = null;
+                }
+
+                mode = "CPU";
             }
 
             runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
@@ -267,12 +301,19 @@ public class Phi3ChatUI {
             modelReady = true;
 
             final String modeLabel = mode;
+            final String backendLabel = backend;
+
             SwingUtilities.invokeLater(() -> {
-                appendSystem(String.format("\u2705 Modell geladen in %.1f s  (hidden=%d, layers=%d, vocab=%d)",
-                        elapsed / 1000.0, config.hiddenSize(),
-                        config.numHiddenLayers(), config.vocabSize()));
+                appendSystem(String.format(
+                        "\u2705 Modell geladen in %.1f s  (hidden=%d, layers=%d, vocab=%d)",
+                        elapsed / 1000.0,
+                        config.hiddenSize(),
+                        config.numHiddenLayers(),
+                        config.vocabSize()));
+                appendSystem("Backend-Konfiguration: " + backendLabel);
                 appendSystem(modeLabel + "-Modus aktiv. Tippe eine Nachricht und dr\u00FCcke Enter.");
                 appendDivider();
+
                 inputField.setEnabled(true);
                 sendButton.setEnabled(true);
                 inputField.requestFocusInWindow();

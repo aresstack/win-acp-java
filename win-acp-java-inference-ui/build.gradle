@@ -1,0 +1,40 @@
+plugins {
+    id 'application'
+    id 'com.gradleup.shadow' version '9.3.0'
+}
+
+dependencies {
+    implementation project(':win-acp-java-inference')
+    implementation project(':win-acp-java-windows-bindings')
+    runtimeOnly 'ch.qos.logback:logback-classic:1.5.6'
+}
+
+application {
+    mainClass = 'com.aresstack.winacp.inference.app.Phi3ChatUI'
+}
+
+shadow {
+    addShadowVariantIntoJavaComponent = false
+}
+
+tasks.named('run', JavaExec) {
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED', '-Xmx4g'
+}
+
+tasks.named('jar') {
+    enabled = false
+}
+
+tasks.named('shadowJar') {
+    archiveClassifier = ''
+    manifest {
+        attributes(
+                'Main-Class': application.mainClass.get(),
+                'Enable-Native-Access': 'ALL-UNNAMED'
+        )
+    }
+}
+
+tasks.named('build') {
+    dependsOn tasks.named('shadowJar')
+}
