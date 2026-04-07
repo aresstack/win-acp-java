@@ -35,17 +35,20 @@ public final class GpuComputeKernel implements AutoCloseable {
 
     private boolean closed = false;
 
-    // D3D12 vtable slots for ID3D12GraphicsCommandList
-    private static final int CMDLIST_SET_PIPELINE_STATE = 24;
-    private static final int CMDLIST_SET_COMPUTE_ROOT_SIG = 33;
-    private static final int CMDLIST_SET_COMPUTE_ROOT_UAV = 36;
-    private static final int CMDLIST_SET_COMPUTE_ROOT_32BIT = 34;
-    private static final int CMDLIST_DISPATCH = 42;
+    // ── ID3D12GraphicsCommandList vtable slots ──────────────────────────
+    // Verified against known-working slots in D3D12Bindings:
+    //   9=Close, 10=Reset, 15=CopyBufferRegion, 26=ResourceBarrier, 28=SetDescriptorHeaps
+    private static final int CMDLIST_DISPATCH = 14;
+    private static final int CMDLIST_SET_PIPELINE_STATE = 25;
+    private static final int CMDLIST_SET_COMPUTE_ROOT_SIG = 29;
+    private static final int CMDLIST_SET_COMPUTE_ROOT_32BIT = 35;  // SetComputeRoot32BitConstants (plural)
+    private static final int CMDLIST_SET_COMPUTE_ROOT_UAV = 41;    // SetComputeRootUnorderedAccessView
 
-    // D3D12Device vtable slot for CreateRootSignature
+    // ── ID3D12Device vtable slots ────────────────────────────────────────
+    // Verified against D3D12Bindings: 8=CreateCommandQueue, 9=CreateCommandAllocator,
+    //   12=CreateCommandList, 14=CreateDescriptorHeap, 27=CreateCommittedResource, 36=CreateFence
+    private static final int DEV_CREATE_COMPUTE_PSO = 11;
     private static final int DEV_CREATE_ROOT_SIGNATURE = 16;
-    // D3D12Device vtable slot for CreateComputePipelineState
-    private static final int DEV_CREATE_COMPUTE_PSO = 22;
 
     /**
      * Create a compute kernel from HLSL source code.
