@@ -167,6 +167,8 @@ public class Phi3ChatCLI {
                           /systemPrompt <text> – set system prompt (empty = clear)
                           /history             – show conversation history
                           /clear               – clear conversation history
+                          /benchmark           – run GPU pipeline benchmark (3 runs × 32 tokens)
+                          /benchmark-v3        – A/B comparison: V2.0 (65 subs) vs V3.0 (1 sub)
                           /exit                – quit the CLI
                         
                         Chat via JSON (one line):
@@ -222,6 +224,9 @@ public class Phi3ChatCLI {
             }
             case "/benchmark" -> {
                 runBenchmark();
+            }
+            case "/benchmark-v3", "/benchmarkv3" -> {
+                runV3Comparison();
             }
             default -> emitError("Unknown command: " + cmd + ". Type /help for available commands.");
         }
@@ -451,6 +456,104 @@ public class Phi3ChatCLI {
 
         } catch (Exception e) {
             emitError("Benchmark failed: " + e.getMessage());
+            e.printStackTrace(System.err);
+        }
+    }
+
+    /**
+     * V2.0 vs V3.0 A/B comparison benchmark.
+     * Runs the same prompt on both pipelines and compares ms/token.
+     */
+    private void runV3Comparison() {
+        if (!modelReady) {
+            emitError("Model not loaded. Cannot benchmark.");
+            return;
+        }
+        if (gpuPipeline == null || !gpuPipeline.hasV3Capability()) {
+            emitError("V3.0 shaders not available. Cannot compare.");
+            return;
+        }
+
+        emitSystem("benchmark-v3", "Starting V2.0 vs V3.0 A/B comparison...");
+
+        String benchPrompt = "<|system|>\nYou are a helpful AI assistant.<|end|>\n"
+                + "<|user|>\nExplain the difference between TCP and UDP in networking.<|end|>\n"
+                + "<|assistant|>\n";
+        int benchTokens = 32;
+        int runs = 3;
+
+        try {
+            // ── V2.0 baseline ────────────────────────────────────────
+            gpuPipeline.setFullGpuEnabled(false);
+
+            // Warmup
+            runtime.resetCache();
+            runtime.generateStreaming(benchPrompt, 8, null);
+
+            double[] v2ms = new double[runs];
+            String v2Profile = null;
+            for (int r = 0; r < runs; r++) {
+                runtime.resetCache();
+                long t0 = System.nanoTime();
+                final int[] count = {0};
+                runtime.generateStreaming(benchPrompt, benchTokens,
+                        (id, text, delta) -> count[0]++);
+                v2ms[r] = (System.nanoTime() - t0) / 1e6 / Math.max(count[0], 1);
+                v2Profile = runtime.getLastProfile();
+            }
+
+            // ── V3.0 ────────────────────────────────────────────────
+            gpuPipeline.setFullGpuEnabled(true);
+
+            // Warmup
+            runtime.resetCache();
+            runtime.generateStreaming(benchPrompt, 8, null);
+
+            double[] v3ms = new double[runs];
+            String v3Profile = null;
+            for (int r = 0; r < runs; r++) {
+                runtime.resetCache();
+                long t0 = System.nanoTime();
+                final int[] count = {0};
+                runtime.generateStreaming(benchPrompt, benchTokens,
+                        (id, text, delta) -> count[0]++);
+                v3ms[r] = (System.nanoTime() - t0) / 1e6 / Math.max(count[0], 1);
+                v3Profile = runtime.getLastProfile();
+            }
+
+            // ── Report ──────────────────────────────────────────────
+            double v2avg = 0, v3avg = 0;
+            for (double v : v2ms) v2avg += v;
+            for (double v : v3ms) v3avg += v;
+            v2avg /= runs;
+            v3avg /= runs;
+
+            double speedup = v2avg / v3avg;
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("type", "benchmark-v3-comparison");
+            result.put("runs", runs);
+            result.put("tokensPerRun", benchTokens);
+
+            Map<String, Object> v2data = new LinkedHashMap<>();
+            v2data.put("avgMsPerToken", round2(v2avg));
+            v2data.put("tokensPerSec", round2(1000.0 / v2avg));
+            v2data.put("profile", v2Profile);
+            result.put("v2", v2data);
+
+            Map<String, Object> v3data = new LinkedHashMap<>();
+            v3data.put("avgMsPerToken", round2(v3avg));
+            v3data.put("tokensPerSec", round2(1000.0 / v3avg));
+            v3data.put("profile", v3Profile);
+            result.put("v3", v3data);
+
+            result.put("speedup", round2(speedup));
+            result.put("submissionsReduction", "65 → 1");
+
+            emitJson(result);
+
+        } catch (Exception e) {
+            emitError("V3 comparison failed: " + e.getMessage());
             e.printStackTrace(System.err);
         }
     }

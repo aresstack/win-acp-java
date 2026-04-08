@@ -613,6 +613,26 @@ public final class Phi3GpuPipeline implements AutoCloseable {
     public boolean hasLmHead() { return kernels.hasLmHead(); }
     public GpuPipeline getPipeline() { return pipeline; }
 
+    /**
+     * Enable/disable V3.0 full GPU decode at runtime.
+     * Useful for A/B benchmarking (V2.0 vs V3.0).
+     * Only effective if V3.0 shaders compiled successfully.
+     */
+    public void setFullGpuEnabled(boolean enabled) {
+        if (enabled && computeKernels != null && computeKernels.hasV3()) {
+            fullGpuEnabled = true;
+            log.info("V3.0 full GPU decode re-enabled");
+        } else {
+            fullGpuEnabled = false;
+            log.info("V3.0 full GPU decode disabled — V2.0 fallback active");
+        }
+    }
+
+    /** Whether V3.0 shaders compiled (even if currently disabled). */
+    public boolean hasV3Capability() {
+        return computeKernels != null && computeKernels.hasV3();
+    }
+
     @Override
     public void close() {
         if (closed) return;

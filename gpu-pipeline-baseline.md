@@ -35,6 +35,17 @@ In der `Phi3ChatCLI` ausführen. Misst 3 Runs à 32 Tokens nach 2 Warmup-Runs.
 
 ## V3.0 Full GPU Pipeline — Implementierung
 
+### Status: IMPLEMENTIERT — Validierung ausstehend
+
+Die V3.0-Implementierung ist vollständig in folgenden Dateien:
+
+| Datei | Inhalt |
+|-------|--------|
+| `Phi3GpuPipeline.java` | `decodeTokenFullGpu()` — 1 Command-List für alle 32 Layers + LM head |
+| `Phi3ComputeShaders.java` | HLSL Compute Shader: RoPE, KV-Cache-Store, AttnScore, AttnSoftmax, AttnVsum |
+| `GpuComputeKernel.java` | Generic D3D12 compute shader Wrapper |
+| `Phi3Runtime.java` | `decodeFast()` mit V3.0-Pfad-Erkennung und automatischem Fallback |
+
 ### Architektur
 
 ```
@@ -76,6 +87,10 @@ argmax(logits)
 | `attn_score` | 3 (Q, Kcache, Scores) | headDim, numHeads, seqLen, scale | Q·K^T dot products |
 | `attn_softmax` | 1 (Scores) | seqLen, numHeads | Per-Head Softmax |
 | `attn_vsum` | 3 (Scores, Vcache, Output) | headDim, numHeads, seqLen | Gewichtete V-Summe |
+| `scale` | 3 (X, Scale, Out) | count | Elementweises Multiply |
+| `rms_norm` | 3 (In, Weight, Out) | dim, eps | RMSNorm mit Group-Shared Reduction |
+| `element_add` | 3 (A, B, C) | count | Elementweise Addition |
+| `swiglu` | 3 (GateUp, Scale, Out) | intermediate | SwiGLU + Scale fused |
 
 ### GPU-Speicher-Budget
 
@@ -117,12 +132,48 @@ argmax(logits)
 
 ---
 
-## Nächste Schritte
+## Bekanntes Issue: CPU-KV-Cache-Synchronisation
 
-- [ ] Benchmark V2.0 Baseline festhalten (`/benchmark`)
-- [ ] V3.0 auf Hardware testen
-- [ ] VRAM-Verbrauch messen
-- [ ] Numerische Korrektheit validieren (V3.0 vs V2.0 Logits vergleichen)
-- [ ] Performance V3.0 vs V2.0 messen
-- [ ] Fallback testen (pos > maxGpuPos → V2.0 automatisch)
+**Kritisch für Fallback**: Wenn V3.0 aktiv ist (`pos < maxGpuPos`), werden
+K/V-Werte nur im GPU-KV-Cache gespeichert. Der CPU-KV-Cache wird nicht
+synchronisiert. Falls der pos-Wert `maxGpuPos` überschreitet und das System
+auf V2.0 zurückfällt, fehlen alle GPU-decodierten Positionen im CPU-Cache.
 
+**Lösung V1**: `maxGpuPos = min(maxPositionEmbeddings, 2048)` begrenzt die
+GPU-KV-Cache-Größe. Über 2048 Positionen fällt das System auf V2.0 zurück.
+In der Praxis sind die meisten Phi-3-mini-Konversationen deutlich kürzer.
+
+**Zukünftige Lösung**: Bei Fallback-Schwellwert GPU→CPU Readback des
+gesamten KV-Cache triggern (einmalig, ~768 MB).
+
+---
+
+## Validierungs-Checkliste
+
+- [ ] V2.0 Baseline-Benchmark festhalten (`/benchmark`)
+- [ ] V3.0 auf Hardware testen — Shader-Kompilierung OK?
+- [ ] V3.0 VRAM-Verbrauch messen (erwarteter Peak ~15.7 GB)
+- [ ] Numerische Korrektheit: V3.0 vs V2.0 Logits vergleichen (Top-5 match?)
+- [ ] Performance V3.0 vs V2.0 messen (ms/token)
+- [ ] Multi-Turn-Stabilität: 10+ Turns ohne Fehler
+- [ ] Fallback testen: pos > maxGpuPos → V2.0 automatisch
+- [ ] KV-Cache-Reuse über Turns validieren
+- [ ] GPU-Ressourcen-Cleanup nach close() validieren (keine Leaks)
+
+---
+
+## Test-Kommandos
+
+### Benchmark (CLI)
+```
+/benchmark
+```
+
+### Manueller Vergleich V2.0 vs V3.0
+```bash
+# V2.0 erzwingen (V3.0 Shader deaktivieren):
+java -Dphi3.gpu.v3=false --enable-native-access=ALL-UNNAMED -Xmx4g -cp ... Phi3ChatCLI
+
+# V3.0 (default, wenn Shader kompilieren):
+java --enable-native-access=ALL-UNNAMED -Xmx4g -cp ... Phi3ChatCLI
+```
