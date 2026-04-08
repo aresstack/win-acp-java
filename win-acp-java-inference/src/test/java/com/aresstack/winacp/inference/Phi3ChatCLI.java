@@ -220,6 +220,9 @@ public class Phi3ChatCLI {
                 conversationHistory.clear();
                 emitCommandResult("/clear", "Conversation history cleared.");
             }
+            case "/benchmark" -> {
+                runBenchmark();
+            }
             default -> emitError("Unknown command: " + cmd + ". Type /help for available commands.");
         }
         return true;
@@ -387,6 +390,69 @@ public class Phi3ChatCLI {
         if (gpuPipeline != null) try { gpuPipeline.close(); } catch (Exception ignored) {}
         if (gpuKernels != null) try { gpuKernels.close(); } catch (Exception ignored) {}
         if (wb != null) try { wb.close(); } catch (Exception ignored) {}
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Benchmark
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void runBenchmark() {
+        if (!modelReady) {
+            emitError("Model not loaded. Cannot benchmark.");
+            return;
+        }
+
+        emitSystem("benchmark", "Starting GPU pipeline benchmark...");
+
+        String warmupPrompt = "<|system|>\nYou are helpful.<|end|>\n<|user|>\nHello<|end|>\n<|assistant|>\n";
+        String benchPrompt = "<|system|>\nYou are a helpful AI assistant.<|end|>\n<|user|>\nExplain the difference between TCP and UDP in networking.<|end|>\n<|assistant|>\n";
+
+        try {
+            // Warmup: 2 short generations
+            for (int i = 0; i < 2; i++) {
+                runtime.generateStreaming(warmupPrompt, 16, null);
+            }
+
+            // Benchmark: 3 runs of 32 tokens each
+            int benchTokens = 32;
+            int runs = 3;
+            double[] msPerToken = new double[runs];
+            String[] profiles = new String[runs];
+
+            for (int r = 0; r < runs; r++) {
+                runtime.resetCache();
+                long t0 = System.nanoTime();
+                final int[] tokenCount = {0};
+                runtime.generateStreaming(benchPrompt, benchTokens,
+                        (id, text, delta) -> tokenCount[0]++);
+                long elapsed = System.nanoTime() - t0;
+                msPerToken[r] = (elapsed / 1e6) / Math.max(tokenCount[0], 1);
+                profiles[r] = runtime.getLastProfile();
+            }
+
+            // Report
+            double avg = 0;
+            for (double v : msPerToken) avg += v;
+            avg /= runs;
+            double min = msPerToken[0], max = msPerToken[0];
+            for (double v : msPerToken) { min = Math.min(min, v); max = Math.max(max, v); }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("type", "benchmark");
+            result.put("mode", mode);
+            result.put("runs", runs);
+            result.put("tokensPerRun", benchTokens);
+            result.put("avgMsPerToken", round2(avg));
+            result.put("minMsPerToken", round2(min));
+            result.put("maxMsPerToken", round2(max));
+            result.put("avgTokensPerSec", round2(1000.0 / avg));
+            result.put("profile", profiles[runs - 1]);
+            emitJson(result);
+
+        } catch (Exception e) {
+            emitError("Benchmark failed: " + e.getMessage());
+            e.printStackTrace(System.err);
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════

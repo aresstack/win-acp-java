@@ -8,26 +8,20 @@ import org.slf4j.LoggerFactory;
 import java.lang.foreign.MemorySegment;
 
 /**
- * V2.0 batched GPU pipeline for Phi-3 decode.
+ * V2.0/V3.0 batched GPU pipeline for Phi-3 decode.
  * <p>
- * Collapses 129 GPU submissions per token into ~65 by batching operations
- * that don't need CPU readback between them:
+ * <b>V2.0</b>: Collapses 129 → 65 submissions (QKV batch + MLP batch per layer).
+ * <p>
+ * <b>V3.0 full GPU decode</b>: ALL 32 layers + lm_head in <b>ONE submission</b>.
  * <ul>
- *   <li><b>QKV batch</b>: upload + QKV GEMM + readback [1 submission]</li>
- *   <li><b>MLP batch</b>: O GEMM → GPU_add(residual) → GPU_RMSNorm →
- *       GateUp GEMM → GPU_SwiGLU → Down GEMM → GPU_add(residual2) → readback
- *       [1 submission, 7 GPU ops]</li>
+ *   <li>GPU-resident KV cache (no CPU roundtrip for K/V)</li>
+ *   <li>GPU RoPE, attention (score → softmax → V-sum), norms, activations</li>
+ *   <li>Hidden states stay on GPU between layers</li>
+ *   <li>Only ONE fence wait per token decode</li>
+ *   <li>Only readback = final logits [vocabSize]</li>
  * </ul>
- * Total: 2 submissions/layer × 32 + 1 lm_head = <b>65 submissions</b> (was 129).
  * <p>
- * <b>Resource State Strategy</b>: All GPU buffers decay to COMMON state after
- * each {@link GpuPipeline#submitAndWait()} (D3D12 buffer decay rule). Within a
- * batch, implicit promotion from COMMON → {COPY_DEST, UAV} is used, with explicit
- * transitions only where required (COPY_DEST → UAV for copy targets, UAV → COPY_SOURCE
- * for readback). No cleanup barriers needed at batch end — decay handles it.
- * <p>
- * <b>Zero-copy chaining</b>: Compute shaders (RMSNorm, SwiGLU) write their output
- * directly into the next GEMM kernel's input buffer, eliminating intermediate copies.
+ * <b>Submission count</b>: 129 (V1.x) → 65 (V2.0) → <b>1</b> (V3.0)
  */
 public final class Phi3GpuPipeline implements AutoCloseable {
 
@@ -37,22 +31,53 @@ public final class Phi3GpuPipeline implements AutoCloseable {
     private final Phi3GpuKernels kernels;
     private ComputeKernelSet computeKernels;  // nullable if shader compilation fails
 
-    // ── GPU-resident intermediate buffer ───────────────────────────────
-    private MemorySegment residualBuf;     // [hidden] for residual add / running state
+    // ── V2.0 GPU-resident intermediate buffer ─────────────────────────
+    private MemorySegment residualBuf;
 
-    // ── GPU-resident weight buffers (per-layer, uploaded once) ─────────
-    private MemorySegment[] postNormWeightBufs;   // [layer] → GPU [hidden]
-    private MemorySegment[] mlpOutScaleBufs;      // [layer] → GPU [intermediate]
+    // ── V2.0 GPU-resident weight buffers (per-layer, uploaded once) ───
+    private MemorySegment[] postNormWeightBufs;
+    private MemorySegment[] mlpOutScaleBufs;
 
-    // ── Pre-allocated barriers ────────────────────────────────────────
+    // ── V2.0 Pre-allocated barriers ──────────────────────────────────
     private MemorySegment uavBarrier;
     private MemorySegment barrierResidualCopyDestToUav;
     private MemorySegment barrierResidualUavToCopySource;
+
+    // ── V3.0 GPU-resident intermediate buffers ────────────────────────
+    private MemorySegment hiddenBufA;       // [hidden] — double-buffer A
+    private MemorySegment hiddenBufB;       // [hidden] — double-buffer B
+    private MemorySegment attnOutBuf;       // [hidden] — attention output
+    private MemorySegment scoresBuf;        // [numHeads * maxPos] — attention scores
+
+    // ── V3.0 GPU KV cache (per-layer) ─────────────────────────────────
+    private MemorySegment[] gpuKCacheBufs;  // [layer] → GPU [maxGpuPos * hidden]
+    private MemorySegment[] gpuVCacheBufs;  // [layer] → GPU [maxGpuPos * hidden]
+    private int maxGpuPos;                  // max positions in GPU KV cache
+
+    // ── V3.0 GPU weight buffers (per-layer, uploaded once) ────────────
+    private MemorySegment[] inputNormWeightBufs;  // [layer] → GPU [hidden]
+    private MemorySegment[] attnOutScaleBufs;     // [layer] → GPU [hidden]
+    private MemorySegment cosCacheBuf;            // GPU [maxPos * halfDim]
+    private MemorySegment sinCacheBuf;            // GPU [maxPos * halfDim]
+    private MemorySegment finalNormWeightBuf;     // GPU [hidden]
+
+    // ── V3.0 Pre-allocated barrier for hiddenBufA upload ──────────────
+    private MemorySegment barrierHiddenACopyDestToUav;
+    private MemorySegment barrierHiddenAUavToCommon;
+
+    // ── V3.0 model config ─────────────────────────────────────────────
+    private int numHeads;
+    private int numKvHeads;
+    private int headDim;
+    private int halfDim;
+    private int numLayers;
+    private int vocabSize;
 
     private final int hidden;
     private final int intermediate;
     private final float rmsNormEps;
     private boolean mlpBatchEnabled = false;
+    private boolean fullGpuEnabled = false;
     private boolean weightsUploaded = false;
     private boolean closed = false;
 
@@ -65,26 +90,49 @@ public final class Phi3GpuPipeline implements AutoCloseable {
         this.hidden = config.hiddenSize();
         this.intermediate = config.intermediateSize();
         this.rmsNormEps = config.rmsNormEps();
+        this.numHeads = config.numAttentionHeads();
+        this.numKvHeads = config.numKeyValueHeads();
+        this.headDim = config.headDim();
+        this.halfDim = headDim / 2;
+        this.numLayers = config.numHiddenLayers();
+        this.vocabSize = config.vocabSize();
 
         long hiddenBytes = (long) hidden * Float.BYTES;
         long qkvBytes = (long) hidden * 3 * Float.BYTES;
         long vocabBytes = (long) config.vocabSize() * Float.BYTES;
 
-        long maxUpload = hiddenBytes;  // largest CPU→GPU upload per batch
+        long maxUpload = hiddenBytes;
         long maxReadback = Math.max(qkvBytes, Math.max(vocabBytes, hiddenBytes));
 
         this.pipeline = new GpuPipeline(wb, maxUpload, maxReadback);
 
-        // ── Try to compile compute shaders for MLP batching ───────────
+        // ── Try V3.0 full GPU shaders first ────────────────────────────
         try {
-            computeKernels = Phi3ComputeShaders.createAll(wb, pipeline.getCommandList());
+            computeKernels = Phi3ComputeShaders.createAllV3(wb, pipeline.getCommandList());
+            initV3Buffers(wb, config);
+            fullGpuEnabled = computeKernels.hasV3();
+            mlpBatchEnabled = true;
+            log.info("Phi3GpuPipeline V3.0: full GPU decode {} (1 submission/token)",
+                    fullGpuEnabled ? "ENABLED" : "DISABLED (shader fallback)");
+        } catch (Exception e) {
+            log.warn("V3.0 shader compilation failed, trying V2.0: {}", e.getMessage());
+            try {
+                computeKernels = Phi3ComputeShaders.createAll(wb, pipeline.getCommandList());
+                mlpBatchEnabled = true;
+            } catch (Exception e2) {
+                log.warn("V2.0 shader compilation also failed: {}", e2.getMessage());
+                computeKernels = null;
+                mlpBatchEnabled = false;
+            }
+        }
 
-            // Allocate GPU residual buffer (only intermediate buffer needed)
+        // ── V2.0 MLP batch buffers (always needed as fallback) ─────────
+        if (mlpBatchEnabled) {
             var dev = wb.getD3d12Device();
             var arena = pipeline.getArena();
-            residualBuf = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
-
-            // Pre-allocate barriers for residualBuf
+            if (residualBuf == null) {
+                residualBuf = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+            }
             uavBarrier = pipeline.allocUavBarrier();
             barrierResidualCopyDestToUav = pipeline.allocTransitionBarrier(residualBuf,
                     D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
@@ -92,22 +140,56 @@ public final class Phi3GpuPipeline implements AutoCloseable {
             barrierResidualUavToCopySource = pipeline.allocTransitionBarrier(residualBuf,
                     D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE);
-
-            mlpBatchEnabled = true;
-            log.info("Phi3GpuPipeline V2.0: compute shaders compiled, MLP batching ENABLED");
-        } catch (Exception e) {
-            log.warn("Compute shader compilation failed, falling back to per-kernel dispatch: {}",
-                    e.getMessage());
-            computeKernels = null;
-            mlpBatchEnabled = false;
         }
 
-        log.info("Phi3GpuPipeline V2.0 ready: mlpBatch={}, upload={}KB readback={}KB",
-                mlpBatchEnabled, maxUpload / 1024, maxReadback / 1024);
+        log.info("Phi3GpuPipeline ready: fullGpu={}, mlpBatch={}, upload={}KB readback={}KB",
+                fullGpuEnabled, mlpBatchEnabled, maxUpload / 1024, maxReadback / 1024);
+    }
+
+    /**
+     * Allocate V3.0 GPU intermediate buffers and KV cache.
+     */
+    private void initV3Buffers(WindowsBindings wb, Phi3Config config)
+            throws WindowsNativeException {
+        var dev = wb.getD3d12Device();
+        var arena = pipeline.getArena();
+        long hiddenBytes = (long) hidden * Float.BYTES;
+
+        // Intermediate buffers
+        hiddenBufA = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+        hiddenBufB = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+        attnOutBuf = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+        residualBuf = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+
+        // Scores buffer: [numHeads * maxPos] — max size for full context
+        maxGpuPos = Math.min(config.maxPositionEmbeddings(), 2048); // VRAM budget limit
+        long scoresBytes = (long) numHeads * maxGpuPos * Float.BYTES;
+        scoresBuf = D3D12Bindings.createDefaultBuffer(dev, scoresBytes, arena);
+
+        // GPU KV cache: per-layer K and V buffers
+        long kvBytes = (long) maxGpuPos * hidden * Float.BYTES;
+        gpuKCacheBufs = new MemorySegment[numLayers];
+        gpuVCacheBufs = new MemorySegment[numLayers];
+        for (int l = 0; l < numLayers; l++) {
+            gpuKCacheBufs[l] = D3D12Bindings.createDefaultBuffer(dev, kvBytes, arena);
+            gpuVCacheBufs[l] = D3D12Bindings.createDefaultBuffer(dev, kvBytes, arena);
+        }
+
+        // Pre-allocate barriers for hiddenBufA upload
+        barrierHiddenACopyDestToUav = pipeline.allocTransitionBarrier(hiddenBufA,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barrierHiddenAUavToCommon = pipeline.allocTransitionBarrier(hiddenBufA,
+                D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COMMON);
+
+        long kvTotalMB = numLayers * 2 * kvBytes / (1024 * 1024);
+        log.info("V3.0 buffers allocated: KV cache={}MB (maxPos={}), scores={}KB",
+                kvTotalMB, maxGpuPos, scoresBytes / 1024);
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Single-GEMM dispatch using shared pipeline
+    // Single-GEMM dispatch using shared pipeline (V2.0 fallback)
     // ═══════════════════════════════════════════════════════════════════
 
     /** Execute a single GEMM via the shared pipeline. */
@@ -139,15 +221,14 @@ public final class Phi3GpuPipeline implements AutoCloseable {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // MLP Batch: 7 GPU ops, 1 submission
+    // MLP Batch: 7 GPU ops, 1 submission (V2.0)
     // ═══════════════════════════════════════════════════════════════════
 
     /** Whether MLP batching is available (compute shaders compiled + weights uploaded). */
     public boolean isMlpBatchEnabled() { return mlpBatchEnabled && weightsUploaded; }
 
     /**
-     * Upload per-layer norm weights and MLP scales to GPU.
-     * Must be called once after construction with access to the model weights.
+     * Upload per-layer weights to GPU (for V2.0 MLP batch + V3.0 full GPU).
      */
     public void uploadLayerWeights(WindowsBindings wb, Phi3Weights weights, Phi3Config config)
             throws WindowsNativeException {
@@ -156,57 +237,57 @@ public final class Phi3GpuPipeline implements AutoCloseable {
         var dev = wb.getD3d12Device();
         var queue = wb.getCommandQueue();
         var arena = pipeline.getArena();
-        int numLayers = config.numHiddenLayers();
+        int nLayers = config.numHiddenLayers();
         long hiddenBytes = (long) hidden * Float.BYTES;
         long interBytes = (long) intermediate * Float.BYTES;
 
-        postNormWeightBufs = new MemorySegment[numLayers];
-        mlpOutScaleBufs = new MemorySegment[numLayers];
+        // V2.0 weights
+        postNormWeightBufs = new MemorySegment[nLayers];
+        mlpOutScaleBufs = new MemorySegment[nLayers];
+
+        // V3.0 weights
+        if (fullGpuEnabled) {
+            inputNormWeightBufs = new MemorySegment[nLayers];
+            attnOutScaleBufs = new MemorySegment[nLayers];
+        }
 
         long t0 = System.currentTimeMillis();
-        for (int l = 0; l < numLayers; l++) {
+        for (int l = 0; l < nLayers; l++) {
             var lw = weights.layers[l];
             postNormWeightBufs[l] = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
             D3D12Bindings.uploadFloats(dev, queue, postNormWeightBufs[l], lw.postNormWeight(), arena);
             mlpOutScaleBufs[l] = D3D12Bindings.createDefaultBuffer(dev, interBytes, arena);
             D3D12Bindings.uploadFloats(dev, queue, mlpOutScaleBufs[l], lw.mlpOutScale(), arena);
+
+            if (fullGpuEnabled) {
+                inputNormWeightBufs[l] = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+                D3D12Bindings.uploadFloats(dev, queue, inputNormWeightBufs[l], lw.inputNormWeight(), arena);
+                attnOutScaleBufs[l] = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+                D3D12Bindings.uploadFloats(dev, queue, attnOutScaleBufs[l], lw.attnOutScale(), arena);
+            }
         }
+
+        // V3.0 global weights
+        if (fullGpuEnabled) {
+            long cosBytes = (long) weights.cosCache.length * Float.BYTES;
+            long sinBytes = (long) weights.sinCache.length * Float.BYTES;
+            cosCacheBuf = D3D12Bindings.createDefaultBuffer(dev, cosBytes, arena);
+            D3D12Bindings.uploadFloats(dev, queue, cosCacheBuf, weights.cosCache, arena);
+            sinCacheBuf = D3D12Bindings.createDefaultBuffer(dev, sinBytes, arena);
+            D3D12Bindings.uploadFloats(dev, queue, sinCacheBuf, weights.sinCache, arena);
+            finalNormWeightBuf = D3D12Bindings.createDefaultBuffer(dev, hiddenBytes, arena);
+            D3D12Bindings.uploadFloats(dev, queue, finalNormWeightBuf, weights.finalNormWeight, arena);
+        }
+
         weightsUploaded = true;
-        log.info("Uploaded {} layer weights to GPU in {} ms", numLayers * 2,
-                System.currentTimeMillis() - t0);
+        long elapsed = System.currentTimeMillis() - t0;
+        int totalBufs = nLayers * 2 + (fullGpuEnabled ? nLayers * 2 + 3 : 0);
+        log.info("Uploaded {} weight buffers to GPU in {} ms (fullGpu={})",
+                totalBufs, elapsed, fullGpuEnabled);
     }
 
     /**
-     * Batched MLP: 7 GPU operations in ONE submission.
-     * <p>
-     * <b>Resource State Flow</b> (all buffers start in COMMON due to decay):
-     * <pre>
-     *   1. CPU→Upload: attnOutput → oK.uploadBuf → copy → oK.inputBuf  [COMMON→COPY_DEST]
-     *   2. CPU→Upload: hiddenInput → pipeline.uploadBuf → copy → residualBuf  [COMMON→COPY_DEST]
-     *   3. Barrier: oK.inputBuf COPY_DEST→UAV, residualBuf COPY_DEST→UAV
-     *   4. DML O_proj: oK.inputBuf(UAV) → oK.outputBuf(COMMON→UAV)
-     *   5. UAV barrier
-     *   6. Compute ADD: oK.outputBuf + residualBuf → residualBuf  (in-place)
-     *   7. UAV barrier
-     *   8. Compute RMSNorm: residualBuf → guK.inputBuf(COMMON→UAV)  [direct write!]
-     *   9. UAV barrier
-     *  10. DML GateUp: guK.inputBuf(UAV) → guK.outputBuf(COMMON→UAV)
-     *  11. UAV barrier
-     *  12. Compute SwiGLU: guK.outputBuf → downK.inputBuf(COMMON→UAV)  [direct write!]
-     *  13. UAV barrier
-     *  14. DML Down: downK.inputBuf(UAV) → downK.outputBuf(COMMON→UAV)
-     *  15. UAV barrier
-     *  16. Compute ADD: residualBuf + downK.outputBuf → residualBuf
-     *  17. Barrier: residualBuf UAV→COPY_SOURCE
-     *  18. Copy: residualBuf → pipeline.readbackBuf
-     *  19. Submit + Wait  (all buffers decay to COMMON automatically)
-     *  20. Readback: pipeline.readbackBuf → hiddenOut
-     * </pre>
-     *
-     * @param attnOutput  CPU [hidden] — attention output (after attn scale)
-     * @param hiddenInput CPU [hidden] — for residual1 = hiddenInput + O_proj
-     * @param hiddenOut   CPU [hidden] — output: residual2 = residual1 + Down
-     * @param layerIdx    layer index
+     * Batched MLP: 7 GPU operations in ONE submission (V2.0).
      */
     public void batchMlp(float[] attnOutput, float[] hiddenInput, float[] hiddenOut,
                           int layerIdx) {
@@ -223,25 +304,11 @@ public final class Phi3GpuPipeline implements AutoCloseable {
         pipeline.begin();
         var cl = pipeline.getCommandList();
 
-        // ── 1+2. Upload attnOutput → oK + hiddenInput → residualBuf ──
-        // Uses separate upload buffers (oK.uploadBuf vs pipeline.uploadBuf)
         oK.recordBatchFromCpu(pipeline, attnOutput);
-        // oK.inputBuf: COPY_DEST→UAV (done inside recordBatchFromCpu)
-        // oK.outputBuf: COMMON→UAV (promoted by DML dispatch)
-
-        // Upload hiddenInput → residualBuf (for residual add)
         pipeline.recordUpload(hiddenInput, 0, hidden, residualBuf, 0);
-        // residualBuf: COMMON → promoted to COPY_DEST
-
-        // ── 3. Barrier: residualBuf COPY_DEST → UAV ──────────────────
         pipeline.recordBarrier(barrierResidualCopyDestToUav);
-
-        // ── 4. (O_proj DML already dispatched by recordBatchFromCpu) ──
-
-        // ── 5. UAV barrier (sync DML O_proj write → compute add read) ─
         pipeline.recordUavBarrier(uavBarrier);
 
-        // ── 6. Compute ADD: oK.outputBuf + residualBuf → residualBuf ──
         computeKernels.add().recordDispatch(cl,
                 new long[]{
                         D3D12Bindings.getGpuVirtualAddress(oK.getOutputBuf()),
@@ -251,11 +318,8 @@ public final class Phi3GpuPipeline implements AutoCloseable {
                 new int[]{ hidden },
                 hidden);
 
-        // ── 7. UAV barrier (sync add write → RMSNorm read) ───────────
         pipeline.recordUavBarrier(uavBarrier);
 
-        // ── 8. Compute RMSNorm: residualBuf → guK.inputBuf (direct!) ─
-        // Writes directly into GateUp kernel's input buffer → zero-copy chain
         int epsBits = Float.floatToRawIntBits(rmsNormEps);
         computeKernels.rmsNorm().recordDispatch(cl,
                 new long[]{
@@ -264,19 +328,12 @@ public final class Phi3GpuPipeline implements AutoCloseable {
                         D3D12Bindings.getGpuVirtualAddress(guK.getInputBuf())
                 },
                 new int[]{ hidden, epsBits },
-                1);  // single thread group for RMSNorm
+                1);
 
-        // ── 9. UAV barrier (sync RMSNorm write → DML GateUp read) ────
         pipeline.recordUavBarrier(uavBarrier);
-
-        // ── 10. DML GateUp: guK.inputBuf(UAV) → guK.outputBuf ────────
         guK.recordBatchDispatchOnly(pipeline);
-
-        // ── 11. UAV barrier (sync GateUp write → SwiGLU read) ────────
         pipeline.recordUavBarrier(uavBarrier);
 
-        // ── 12. Compute SwiGLU: guK.outputBuf → downK.inputBuf (direct!)
-        // Writes directly into Down kernel's input buffer → zero-copy chain
         computeKernels.swiglu().recordDispatch(cl,
                 new long[]{
                         D3D12Bindings.getGpuVirtualAddress(guK.getOutputBuf()),
@@ -286,16 +343,10 @@ public final class Phi3GpuPipeline implements AutoCloseable {
                 new int[]{ intermediate },
                 intermediate);
 
-        // ── 13. UAV barrier (sync SwiGLU write → DML Down read) ──────
         pipeline.recordUavBarrier(uavBarrier);
-
-        // ── 14. DML Down: downK.inputBuf(UAV) → downK.outputBuf ──────
         downK.recordBatchDispatchOnly(pipeline);
-
-        // ── 15. UAV barrier (sync Down write → add read) ─────────────
         pipeline.recordUavBarrier(uavBarrier);
 
-        // ── 16. Compute ADD: residualBuf + downK.outputBuf → residualBuf
         computeKernels.add().recordDispatch(cl,
                 new long[]{
                         D3D12Bindings.getGpuVirtualAddress(residualBuf),
@@ -305,26 +356,261 @@ public final class Phi3GpuPipeline implements AutoCloseable {
                 new int[]{ hidden },
                 hidden);
 
-        // ── 17. Barrier: residualBuf UAV → COPY_SOURCE (for readback) ─
         pipeline.recordBarrier(barrierResidualUavToCopySource);
-
-        // ── 18. Copy residualBuf → readbackBuf ───────────────────────
         pipeline.recordReadback(residualBuf, 0, hiddenBytes);
-
-        // ── 19. Submit + Wait (buffers decay to COMMON automatically) ─
         pipeline.submitAndWait();
-
-        // ── 20. Readback → CPU ───────────────────────────────────────
         pipeline.readbackInto(hiddenOut, 0, hidden);
     }
 
-    /** Whether the pipeline has GPU kernels for the given layer. */
+    // ═══════════════════════════════════════════════════════════════════
+    // V3.0: Full GPU Decode — ALL layers + lm_head in 1 submission
+    // ═══════════════════════════════════════════════════════════════════
+
+    /** Whether V3.0 full GPU decode is available. */
+    public boolean isFullGpuEnabled() {
+        return fullGpuEnabled && weightsUploaded;
+    }
+
+    /** Max positions supported by GPU KV cache. */
+    public int getMaxGpuPos() { return maxGpuPos; }
+
+    /**
+     * Decode ONE token entirely on GPU. All 32 layers + lm_head recorded
+     * into a SINGLE command list with ONE fence wait.
+     * <p>
+     * <b>Total submissions: 1</b> (was 129 in V1.x, 65 in V2.0)
+     * <p>
+     * The embedding lookup is the only CPU operation. Everything else
+     * (RMSNorm, QKV GEMM, RoPE, KV cache store, attention, activation scale,
+     * O GEMM, residual add, post-norm, GateUp GEMM, SwiGLU, Down GEMM,
+     * final norm, lm_head) runs on GPU.
+     *
+     * @param embedding  CPU [hidden] — token embedding (from weights.embedTokens)
+     * @param pos        current KV cache position (0-based)
+     * @param logitsOut  CPU [vocabSize] — output logits (filled after return)
+     */
+    public void decodeTokenFullGpu(float[] embedding, int pos, float[] logitsOut) {
+        if (!isFullGpuEnabled()) {
+            throw new IllegalStateException("Full GPU decode not enabled");
+        }
+        if (pos >= maxGpuPos) {
+            throw new IllegalStateException("Position " + pos + " exceeds GPU KV cache limit " + maxGpuPos);
+        }
+
+        int seqLen = pos + 1;  // total positions to attend to
+        int epsBits = Float.floatToRawIntBits(rmsNormEps);
+        float scale = (float) (1.0 / Math.sqrt(headDim));
+        int scaleBits = Float.floatToRawIntBits(scale);
+        int ropePairs = (numHeads + numKvHeads) * halfDim;
+
+        pipeline.begin();
+        var cl = pipeline.getCommandList();
+
+        // ── Upload embedding → hiddenBufA ─────────────────────────────
+        pipeline.recordUpload(embedding, 0, hidden, hiddenBufA, 0);
+        pipeline.recordBarrier(barrierHiddenACopyDestToUav);
+
+        // ── Process 32 layers ─────────────────────────────────────────
+        MemorySegment currentHidden = hiddenBufA;
+        MemorySegment nextHidden = hiddenBufB;
+
+        for (int l = 0; l < numLayers; l++) {
+            recordLayerFullGpu(cl, l, currentHidden, nextHidden, pos, seqLen,
+                    epsBits, scaleBits, ropePairs);
+            // Swap buffers
+            var tmp = currentHidden;
+            currentHidden = nextHidden;
+            nextHidden = tmp;
+        }
+
+        // ── Final RMSNorm → lm_head input ──────────────────────────────
+        MatMulNBitsKernel lmK = kernels.lmHead();
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.rmsNorm().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(currentHidden),
+                        D3D12Bindings.getGpuVirtualAddress(finalNormWeightBuf),
+                        D3D12Bindings.getGpuVirtualAddress(lmK.getInputBuf())
+                },
+                new int[]{ hidden, epsBits },
+                1);
+
+        // ── LM head GEMM ──────────────────────────────────────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        lmK.recordBatchDispatchOnly(pipeline);
+
+        // ── Readback logits ───────────────────────────────────────────
+        MemorySegment lmOutBarrier = pipeline.allocTransitionBarrier(lmK.getOutputBuf(),
+                D3D12Bindings.D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12Bindings.D3D12_RESOURCE_STATE_COPY_SOURCE);
+        pipeline.recordBarrier(lmOutBarrier);
+        long vocabBytes = (long) vocabSize * Float.BYTES;
+        pipeline.recordReadback(lmK.getOutputBuf(), 0, vocabBytes);
+
+        // ── Cleanup: hiddenBufA back to COMMON (explicit transition) ──
+        pipeline.recordBarrier(barrierHiddenAUavToCommon);
+
+        // ── SINGLE submit + wait ──────────────────────────────────────
+        pipeline.submitAndWait();
+
+        // ── Readback logits to CPU ────────────────────────────────────
+        pipeline.readbackInto(logitsOut, 0, vocabSize);
+    }
+
+    /**
+     * Record one full decoder layer into the command list.
+     * All operations (norm, QKV, RoPE, KV cache, attention, scale, O, residual,
+     * post-norm, GateUp, SwiGLU, Down, residual) are GPU-only.
+     */
+    private void recordLayerFullGpu(MemorySegment cl, int l,
+                                     MemorySegment currentHidden, MemorySegment nextHidden,
+                                     int pos, int seqLen,
+                                     int epsBits, int scaleBits, int ropePairs) {
+        MatMulNBitsKernel qkvK = kernels.qkvFused(l);
+        MatMulNBitsKernel oK = kernels.oProj(l);
+        MatMulNBitsKernel guK = kernels.gateUpProj(l);
+        MatMulNBitsKernel downK = kernels.downProj(l);
+
+        // ── 1. Pre-attention RMSNorm: currentHidden → qkvK.inputBuf ──
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.rmsNorm().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(currentHidden),
+                        D3D12Bindings.getGpuVirtualAddress(inputNormWeightBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(qkvK.getInputBuf())
+                },
+                new int[]{ hidden, epsBits },
+                1);
+
+        // ── 2. QKV GEMM: qkvK.inputBuf → qkvK.outputBuf [3*hidden] ──
+        pipeline.recordUavBarrier(uavBarrier);
+        qkvK.recordBatchDispatchOnly(pipeline);
+
+        // ── 3. RoPE: in-place on qkvK.outputBuf (Q and K portions) ───
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.rope().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(qkvK.getOutputBuf()),
+                        D3D12Bindings.getGpuVirtualAddress(cosCacheBuf),
+                        D3D12Bindings.getGpuVirtualAddress(sinCacheBuf)
+                },
+                new int[]{ headDim, numHeads, numKvHeads, pos },
+                ropePairs);
+
+        // ── 4. KV cache store: K/V from qkvK.outputBuf → GPU cache ───
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.kvCacheStore().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(qkvK.getOutputBuf()),
+                        D3D12Bindings.getGpuVirtualAddress(gpuKCacheBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(gpuVCacheBufs[l])
+                },
+                new int[]{ hidden, pos },
+                hidden);
+
+        // ── 5. Attention scores: Q · K_cache → scores ────────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.attnScore().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(qkvK.getOutputBuf()), // Q portion
+                        D3D12Bindings.getGpuVirtualAddress(gpuKCacheBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(scoresBuf)
+                },
+                new int[]{ headDim, numHeads, seqLen, scaleBits },
+                numHeads * seqLen);
+
+        // ── 6. Attention softmax: scores (in-place) ──────────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.attnSoftmax().recordDispatch(cl,
+                new long[]{ D3D12Bindings.getGpuVirtualAddress(scoresBuf) },
+                new int[]{ seqLen, numHeads },
+                numHeads);  // 1 group per head
+
+        // ── 7. Attention V-sum: scores · V_cache → attnOutBuf ─────────
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.attnVsum().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(scoresBuf),
+                        D3D12Bindings.getGpuVirtualAddress(gpuVCacheBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(attnOutBuf)
+                },
+                new int[]{ headDim, numHeads, seqLen },
+                numHeads);  // 1 group per head
+
+        // ── 8. Attention scale: attnOutBuf → oK.inputBuf ─────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.scale().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(attnOutBuf),
+                        D3D12Bindings.getGpuVirtualAddress(attnOutScaleBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(oK.getInputBuf())
+                },
+                new int[]{ hidden },
+                hidden);
+
+        // ── 9. O projection GEMM ─────────────────────────────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        oK.recordBatchDispatchOnly(pipeline);
+
+        // ── 10. Residual1 add: currentHidden + oK.outputBuf → residualBuf ─
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.add().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(currentHidden),
+                        D3D12Bindings.getGpuVirtualAddress(oK.getOutputBuf()),
+                        D3D12Bindings.getGpuVirtualAddress(residualBuf)
+                },
+                new int[]{ hidden },
+                hidden);
+
+        // ── 11. Post-attention RMSNorm: residualBuf → guK.inputBuf ────
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.rmsNorm().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(residualBuf),
+                        D3D12Bindings.getGpuVirtualAddress(postNormWeightBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(guK.getInputBuf())
+                },
+                new int[]{ hidden, epsBits },
+                1);
+
+        // ── 12. GateUp GEMM ──────────────────────────────────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        guK.recordBatchDispatchOnly(pipeline);
+
+        // ── 13. SwiGLU + Scale: guK.outputBuf → downK.inputBuf ───────
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.swiglu().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(guK.getOutputBuf()),
+                        D3D12Bindings.getGpuVirtualAddress(mlpOutScaleBufs[l]),
+                        D3D12Bindings.getGpuVirtualAddress(downK.getInputBuf())
+                },
+                new int[]{ intermediate },
+                intermediate);
+
+        // ── 14. Down GEMM ────────────────────────────────────────────
+        pipeline.recordUavBarrier(uavBarrier);
+        downK.recordBatchDispatchOnly(pipeline);
+
+        // ── 15. Residual2 add: residualBuf + downK.outputBuf → nextHidden ─
+        pipeline.recordUavBarrier(uavBarrier);
+        computeKernels.add().recordDispatch(cl,
+                new long[]{
+                        D3D12Bindings.getGpuVirtualAddress(residualBuf),
+                        D3D12Bindings.getGpuVirtualAddress(downK.getOutputBuf()),
+                        D3D12Bindings.getGpuVirtualAddress(nextHidden)
+                },
+                new int[]{ hidden },
+                hidden);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Accessors
+    // ═══════════════════════════════════════════════════════════════════
+
     public boolean hasLayer(int layerIdx) { return kernels.hasLayer(layerIdx); }
-
-    /** Whether lm_head is on GPU. */
     public boolean hasLmHead() { return kernels.hasLmHead(); }
-
-    /** Underlying pipeline. */
     public GpuPipeline getPipeline() { return pipeline; }
 
     @Override
