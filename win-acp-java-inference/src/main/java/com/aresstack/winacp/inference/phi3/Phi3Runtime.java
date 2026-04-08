@@ -167,11 +167,8 @@ public final class Phi3Runtime {
         decLogits   = new float[config.vocabSize()];
         decScoresPool = new float[config.numAttentionHeads() * maxPos];
 
-        if (gpuPipeline != null && gpuPipeline.isFullGpuEnabled()) {
-            log.info("Phi3Runtime: V3.0 full GPU pipeline — 1 submission/token (maxPos={})",
-                    gpuPipeline.getMaxGpuPos());
-        } else if (gpuPipeline != null) {
-            log.info("Phi3Runtime: V2.0 pipeline mode — shared cmd infra");
+        if (gpuPipeline != null) {
+            log.info("Phi3Runtime: V2.0 pipeline mode — shared cmd infra, MLP batch");
         } else if (gpuKernels != null) {
             log.info("Phi3Runtime: GPU mode — {}/{} layers on GPU, lmHead={}",
                     gpuKernels.getGpuLayers(), config.numHiddenLayers(), gpuKernels.hasLmHead());
@@ -366,20 +363,16 @@ public final class Phi3Runtime {
         double pctDivisor = totalDecode > 0 ? totalDecode : 1;
 
         int gpuLayers = (gpuKernels != null) ? gpuKernels.getGpuLayers() : 0;
-        boolean fullGpu = gpuPipeline != null && gpuPipeline.isFullGpuEnabled();
         boolean mlpBatch = gpuPipeline != null && gpuPipeline.isMlpBatchEnabled();
 
         int gpuSubmissions;
         String pipelineTag;
-        if (fullGpu) {
-            gpuSubmissions = 1;
-            pipelineTag = "V3.0 full-GPU (1 sub/tok)";
-        } else if (mlpBatch) {
+        if (mlpBatch) {
             int subsPerLayer = 2;  // QKV + MLP_batch
             gpuSubmissions = gpuLayers * subsPerLayer + ((gpuKernels != null && gpuKernels.hasLmHead()) ? 1 : 0);
             pipelineTag = "V2.0 MLP-batch";
         } else {
-            int subsPerLayer = gpuPipeline != null ? 4 : 4;
+            int subsPerLayer = 4;
             gpuSubmissions = gpuLayers * subsPerLayer + ((gpuKernels != null && gpuKernels.hasLmHead()) ? 1 : 0);
             pipelineTag = gpuPipeline != null ? "V2.0 pipeline" : "V1.x per-kernel";
         }
@@ -390,22 +383,16 @@ public final class Phi3Runtime {
                 profPrefillNs / 1e6, profPrefillTokens, cachedSeqLen - profSteps - profPrefillTokens));
         sb.append(String.format("  GPU projections: %.1f ms avg (%.0f%%) [%d subs/tok, %s]%n",
                 profGpuProjNs / 1e6 / profSteps, 100.0 * profGpuProjNs / pctDivisor, gpuSubmissions, pipelineTag));
-        if (!fullGpu) {
-            sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%) [%d heads, parallel=%s]%n",
-                    profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor,
-                    config.numAttentionHeads(),
-                    Runtime.getRuntime().availableProcessors() > 1 ? "yes (cores=" + Runtime.getRuntime().availableProcessors() + ")" : "no"));
-            sb.append(String.format("  CPU norms+RoPE:  %.1f ms avg (%.0f%%)%n",
-                    profCpuNormNs / 1e6 / profSteps, 100.0 * profCpuNormNs / pctDivisor));
-            sb.append(String.format("  CPU SwiGLU:      %.1f ms avg (%.0f%%)%n",
-                    profCpuActNs / 1e6 / profSteps, 100.0 * profCpuActNs / pctDivisor));
-            sb.append(String.format("  LM head:         %.1f ms avg (%.0f%%)%n",
-                    profLmHeadNs / 1e6 / profSteps, 100.0 * profLmHeadNs / pctDivisor));
-        } else {
-            sb.append(String.format("  GPU attention:   included in GPU projections (GPU KV cache)%n"));
-            sb.append(String.format("  GPU norms/RoPE:  included in GPU projections%n"));
-            sb.append(String.format("  GPU SwiGLU:      included in GPU projections%n"));
-        }
+        sb.append(String.format("  CPU attention:   %.1f ms avg (%.0f%%) [%d heads, parallel=%s]%n",
+                profCpuAttnNs / 1e6 / profSteps, 100.0 * profCpuAttnNs / pctDivisor,
+                config.numAttentionHeads(),
+                Runtime.getRuntime().availableProcessors() > 1 ? "yes (cores=" + Runtime.getRuntime().availableProcessors() + ")" : "no"));
+        sb.append(String.format("  CPU norms+RoPE:  %.1f ms avg (%.0f%%)%n",
+                profCpuNormNs / 1e6 / profSteps, 100.0 * profCpuNormNs / pctDivisor));
+        sb.append(String.format("  CPU SwiGLU:      %.1f ms avg (%.0f%%)%n",
+                profCpuActNs / 1e6 / profSteps, 100.0 * profCpuActNs / pctDivisor));
+        sb.append(String.format("  LM head:         %.1f ms avg (%.0f%%)%n",
+                profLmHeadNs / 1e6 / profSteps, 100.0 * profLmHeadNs / pctDivisor));
         sb.append(String.format("  Token decode:    %.1f ms avg%n", profTokenDecNs / 1e6 / profSteps));
         return sb.toString();
     }
@@ -490,34 +477,12 @@ public final class Phi3Runtime {
     /**
      * Process a single new token using pre-allocated buffers.
      * <p>
-     * <b>V3.0 full GPU path</b>: If the GPU pipeline supports full GPU decode
-     * and the position is within GPU KV cache limits, the entire token decode
-     * (all 32 layers + lm_head) runs as ONE GPU submission. Only embedding
-     * lookup happens on CPU.
-     * <p>
-     * <b>Fallback</b>: V2.0 per-layer path (65 submissions) or CPU-only.
+     * V2.0: per-layer path (65 submissions with MLP batch) or CPU-only.
      */
     private float[] decodeFast(int tokenId) {
         int hidden = config.hiddenSize();
         int pos = cachedSeqLen;
 
-        // ── V3.0: Full GPU decode (1 submission per token) ──────────
-        if (gpuPipeline != null && gpuPipeline.isFullGpuEnabled()
-                && pos < gpuPipeline.getMaxGpuPos()) {
-            long t0 = System.nanoTime();
-
-            // Embedding lookup is the ONLY CPU operation
-            System.arraycopy(weights.embedTokens, tokenId * hidden, decBuf, 0, hidden);
-
-            // Entire decode on GPU: all 32 layers + final norm + lm_head
-            gpuPipeline.decodeTokenFullGpu(decBuf, pos, decLogits);
-
-            profGpuProjNs += System.nanoTime() - t0;
-            cachedSeqLen = pos + 1;
-            return decLogits;
-        }
-
-        // ── Fallback: V2.0/V1.x per-layer path ──────────────────────
         // Embedding lookup → decBuf
         System.arraycopy(weights.embedTokens, tokenId * hidden, decBuf, 0, hidden);
 
