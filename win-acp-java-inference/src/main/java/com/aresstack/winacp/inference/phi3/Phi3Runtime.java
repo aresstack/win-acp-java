@@ -413,7 +413,6 @@ public final class Phi3Runtime {
     public void resetCache() {
         cachedSeqLen = 0;
         cachedTokenIds = new int[0];
-        gpuV3Active = false;
         for (float[][] layer : kvCacheK) Arrays.fill(layer, null);
         for (float[][] layer : kvCacheV) Arrays.fill(layer, null);
     }
@@ -488,9 +487,6 @@ public final class Phi3Runtime {
 
     // ── Fast single-token decode (pre-allocated buffers) ─────────────────
 
-    // Track whether V3.0 GPU path was used — if so, CPU KV cache is stale
-    private boolean gpuV3Active = false;
-
     /**
      * Process a single new token using pre-allocated buffers.
      * <p>
@@ -500,12 +496,6 @@ public final class Phi3Runtime {
      * lookup happens on CPU.
      * <p>
      * <b>Fallback</b>: V2.0 per-layer path (65 submissions) or CPU-only.
-     * <p>
-     * <b>KV cache safety</b>: When V3.0 is active, the CPU KV cache is NOT
-     * updated (K/V live only on GPU). If position reaches maxGpuPos, we would
-     * need to fall back to V2.0, but the CPU cache is empty for all V3.0-decoded
-     * positions. V1 solution: treat maxGpuPos as a hard ceiling and stop
-     * generation rather than producing corrupted output.
      */
     private float[] decodeFast(int tokenId) {
         int hidden = config.hiddenSize();
@@ -524,19 +514,6 @@ public final class Phi3Runtime {
 
             profGpuProjNs += System.nanoTime() - t0;
             cachedSeqLen = pos + 1;
-            gpuV3Active = true;
-            return decLogits;
-        }
-
-        // ── V3.0 → V2.0 fallback guard ──────────────────────────────
-        // If V3.0 was active, CPU KV cache is stale — cannot fall back safely.
-        // Log a warning and stop rather than produce corrupted output.
-        if (gpuV3Active && gpuPipeline != null && gpuPipeline.isFullGpuEnabled()
-                && pos >= gpuPipeline.getMaxGpuPos()) {
-            log.warn("V3.0 GPU KV cache limit reached (pos={}). Cannot fall back to V2.0 "
-                    + "without GPU→CPU KV cache sync (not implemented in V1). "
-                    + "Stopping generation at this position.", pos);
-            // Return current logits unchanged (will produce EOS or repeated token)
             return decLogits;
         }
 
