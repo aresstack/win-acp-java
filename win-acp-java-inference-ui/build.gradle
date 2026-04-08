@@ -35,6 +35,11 @@ tasks.named('shadowJar') {
     }
 }
 
+// shadowJar replaces the normal jar — tell distribution tasks about it
+tasks.named('distZip')      { dependsOn tasks.named('shadowJar') }
+tasks.named('distTar')      { dependsOn tasks.named('shadowJar') }
+tasks.named('startScripts') { dependsOn tasks.named('shadowJar') }
+
 tasks.named('build') {
     dependsOn tasks.named('shadowJar')
 }
