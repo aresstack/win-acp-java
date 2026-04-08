@@ -2,6 +2,7 @@ package com.aresstack.winacp.inference;
 
 import com.aresstack.winacp.inference.phi3.Phi3Config;
 import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
+import com.aresstack.winacp.inference.phi3.Phi3GpuPipeline;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer.ChatMessage;
@@ -58,7 +59,7 @@ public class Phi3ChatUI {
     }
 
     private static String resolveBackend() {
-        String value = System.getProperty("phi3.backend", "cpu");
+        String value = System.getProperty("phi3.backend", "auto");
         if (value == null) {
             return "cpu";
         }
@@ -78,6 +79,7 @@ public class Phi3ChatUI {
     private Phi3Runtime runtime;
     private WindowsBindings wb;
     private Phi3GpuKernels gpuKernels;
+    private Phi3GpuPipeline gpuPipeline;
     private volatile boolean modelReady = false;
     private volatile boolean generating = false;
 
@@ -220,6 +222,7 @@ public class Phi3ChatUI {
         frame.addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
             public void windowClosing(java.awt.event.WindowEvent e) {
+                if (gpuPipeline != null) try { gpuPipeline.close(); } catch (Exception ignored) {}
                 if (gpuKernels != null) try { gpuKernels.close(); } catch (Exception ignored) {}
                 if (wb != null) try { wb.close(); } catch (Exception ignored) {}
             }
@@ -268,34 +271,35 @@ public class Phi3ChatUI {
                         gpuKernels = Phi3GpuKernels.create(
                                 wb, weights, config, gpuLayers, gpuLmHead);
 
-                        mode = "GPU (" + gpuKernels.getGpuLayers() + "/"
-                                + config.numHiddenLayers() + " layers)";
+                        // V2.0: shared pipeline (65 submissions/token instead of 129)
+                        gpuPipeline = new Phi3GpuPipeline(wb, gpuKernels, config);
+                        gpuPipeline.uploadLayerWeights(wb, weights, config);
+
+                        mode = "GPU V2.0 (" + gpuKernels.getGpuLayers() + "/"
+                                + config.numHiddenLayers() + " layers, pipeline)";
                     }
                 }
             } catch (Exception gpuEx) {
                 System.err.println("GPU init failed, continue on CPU: " + gpuEx.getMessage());
                 gpuEx.printStackTrace();
 
+                if (gpuPipeline != null) {
+                    try { gpuPipeline.close(); } catch (Exception ignored) {}
+                    gpuPipeline = null;
+                }
                 if (gpuKernels != null) {
-                    try {
-                        gpuKernels.close();
-                    } catch (Exception ignored) {
-                    }
+                    try { gpuKernels.close(); } catch (Exception ignored) {}
                     gpuKernels = null;
                 }
-
                 if (wb != null) {
-                    try {
-                        wb.close();
-                    } catch (Exception ignored) {
-                    }
+                    try { wb.close(); } catch (Exception ignored) {}
                     wb = null;
                 }
 
                 mode = "CPU";
             }
 
-            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
+            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels, gpuPipeline);
 
             long elapsed = System.currentTimeMillis() - t0;
             modelReady = true;

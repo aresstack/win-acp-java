@@ -3,6 +3,7 @@ package com.aresstack.winacp.inference.app;
 import com.aresstack.winacp.inference.Phi3InferenceEngine;
 import com.aresstack.winacp.inference.phi3.Phi3Config;
 import com.aresstack.winacp.inference.phi3.Phi3GpuKernels;
+import com.aresstack.winacp.inference.phi3.Phi3GpuPipeline;
 import com.aresstack.winacp.inference.phi3.Phi3Runtime;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer;
 import com.aresstack.winacp.inference.phi3.Phi3Tokenizer.ChatMessage;
@@ -60,6 +61,7 @@ public class Phi3ChatUI {
     private Phi3Runtime runtime;
     private WindowsBindings windowsBindings;
     private Phi3GpuKernels gpuKernels;
+    private Phi3GpuPipeline gpuPipeline;
     private volatile boolean modelReady = false;
     private volatile boolean generating = false;
 
@@ -246,7 +248,7 @@ public class Phi3ChatUI {
             weights = Phi3Weights.load(MODEL_DIR, config);
 
             final String activeMode = initialiseInferenceMode();
-            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels);
+            runtime = new Phi3Runtime(config, weights, tokenizer, gpuKernels, gpuPipeline);
             modelReady = true;
 
             final long elapsedMillis = System.currentTimeMillis() - startTime;
@@ -299,7 +301,11 @@ public class Phi3ChatUI {
                     gpuKernels = Phi3GpuKernels.create(
                             windowsBindings, weights, config, gpuLayers, gpuLmHead);
 
-                    return "GPU (" + gpuKernels.getGpuLayers() + "/" + config.numHiddenLayers() + " layers)";
+                    // V2.0: shared pipeline (65 submissions/token instead of 129)
+                    gpuPipeline = new Phi3GpuPipeline(windowsBindings, gpuKernels, config);
+                    gpuPipeline.uploadLayerWeights(windowsBindings, weights, config);
+
+                    return "GPU V2.0 (" + gpuKernels.getGpuLayers() + "/" + config.numHiddenLayers() + " layers, pipeline)";
                 }
             }
         } catch (Exception exception) {
@@ -668,6 +674,14 @@ public class Phi3ChatUI {
     }
 
     private void closeGpuResources() {
+        if (gpuPipeline != null) {
+            try {
+                gpuPipeline.close();
+            } catch (Exception ignored) {
+            }
+            gpuPipeline = null;
+        }
+
         if (gpuKernels != null) {
             try {
                 gpuKernels.close();
